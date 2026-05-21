@@ -1,75 +1,168 @@
 # packethose
 
-A framed-IP-over-TCP tunnel: wraps raw IP packets in a 2-byte-length TCP
-framing protocol and pairs with a virtual netdev so applications see it
-as a normal interface.
+A framed-IP-over-TCP tunnel: wraps raw IP packets in a 2-byte-length
+TCP framing protocol and pairs with a virtual netdev so applications
+see it as a normal interface.
+
+Multi-lane outer connections, optional AEAD encryption, optional
+tcp-brutal congestion control, multi-client server with per-client IP
+assignment, and a userspace gVisor netstack mode for environments
+without CAP_NET_ADMIN. Linux on the kernel-TUN fast path; Go-only and
+portable in userspace mode.
 
 ## Why
 
-On constrained UDP paths (e.g. virtio-net descriptor caps inside VMs),
-wrapping inner traffic in TCP rides the host's TSO/GRO fast path and
-delivers multi-Gbps where naive UDP tunnels stall well below 1 Gbps.
+A surprising number of cloud / VPS providers cap UDP throughput well
+below their advertised network speed — virtio-net descriptor limits,
+hypervisor offload mismatches, MAP-T BR queues, or just plain
+shaping on UDP that doesn't exist on TCP. The symptom: a 10 Gbps
+"unmetered" port that delivers 200 Mbps of UDP per flow and
+multiple-Gbps of TCP.
 
-## Wire protocol
+Packethose was written for that case. Wrapping the inner traffic in
+TCP rides the host's TSO/GRO fast path and delivers multi-Gbps where
+naive UDP tunnels stall. Multiple parallel TCP lanes spread per-flow
+head-of-line blocking, give modern congestion control independent
+windows to work with, and stay fast on lossy or reorder-heavy paths
+where a single UDP/QUIC flow would back off.
 
-### Default mode
-```
-[uint16 BE length][raw L3 packet][uint16 BE length][raw L3 packet]...
-```
-Inner IP version (4/6) is detected from the first nibble. Packets are
-written directly to the TUN device.
+## Install
 
-### `--vnet_hdr` mode (recommended for low MTU)
-```
-[uint16 BE length][virtio_net_hdr (10 bytes, LE fields)][L3 packet]
-```
-Length includes the 10-byte vnet_hdr. The vnet_hdr carries GSO metadata
-so the receiver can pass coalesced super-packets to the kernel and let
-it segment on egress. Both peers must run in the same mode.
-
-### Encryption (`--encrypt aes-gcm|chacha20`)
-With encryption, each frame's payload is wrapped by AEAD:
-```
-[uint16 BE length][AEAD ciphertext+tag]
-```
-Length is the ciphertext+tag length. Nonce is a per-lane per-direction
-64-bit counter; TCP keeps the endpoints in lockstep so the counter does
-not appear on the wire. Requires `--psk`.
-
-### Handshake (when `--psk` is set)
-```
-client -> magic(4) || ver(1)=2 || cipher(1) || nonce_c(32)
-server -> magic(4) || ver(1)=2 || cipher(1) || HMAC(psk, ver||cipher||nonce_c)(32) || nonce_s(32)
-client -> HMAC(psk, ver||cipher||nonce_s)(32)
-```
-Per-direction session keys are derived via HKDF-SHA256 over
-`(psk, nonce_c || nonce_s)`.
-
-## Build
+### Container
 
 ```bash
-GOOS=linux GOARCH=amd64 GOAMD64=v3 CGO_ENABLED=0 \
-  go build -buildvcs=false -ldflags="-s -w" -o packethose .
+podman pull ghcr.io/cmspam/packethose:latest
+# or
+docker pull ghcr.io/cmspam/packethose:latest
 ```
 
-## Run
+### Binary
+
+Grab `packethose-linux-amd64` or `packethose-linux-arm64` from the
+[releases page](https://github.com/cmspam/packethose/releases).
+Static, no dependencies.
+
+### From source
 
 ```bash
-# pre-create the TUN device on each side
-ip tuntap add tt0 mode tun multi_queue
-ip link set tt0 up
-ip link set tt0 mtu 1500
-ip addr add 10.66.0.1/24 dev tt0   # or .2 on the client side
+git clone https://github.com/cmspam/packethose
+cd packethose
+go build -trimpath -ldflags='-s -w' -o packethose ./cmd/packethose
+```
 
+## Quick start
+
+### Single-peer
+
+```bash
 # server
-./packethose server --listen 0.0.0.0:4500 --tun tt0 --lanes 4 --vnet_hdr
+ip tuntap add ph0 mode tun multi_queue
+ip link set ph0 up
+ip addr add 10.66.0.1/24 dev ph0
+./packethose server --listen 0.0.0.0:4500 --tun ph0 --lanes 4
 
 # client
-./packethose client --peer <server-ip>:4500 --tun tt0 --lanes 4 --vnet_hdr
+ip tuntap add ph0 mode tun multi_queue
+ip link set ph0 up
+ip addr add 10.66.0.2/24 dev ph0
+./packethose client --peer <server-ip>:4500 --tun ph0 --lanes 4
 ```
 
-For hardened deployments add `--psk <hex>` and `--encrypt aes-gcm` on
-both peers, and `--allow <client-IP>` on the server.
+`ping 10.66.0.1` from the client side, traffic flows through the
+tunnel. Add iptables MASQUERADE on the server to route the tunnel
+clients to the internet:
+
+```bash
+sysctl -w net.ipv4.ip_forward=1
+iptables -t nat -A POSTROUTING -s 10.66.0.0/24 -o eth0 -j MASQUERADE
+```
+
+### Authenticated and encrypted
+
+```bash
+# generate a PSK once, share it out-of-band
+PSK=$(openssl rand -hex 32)
+
+# both sides
+./packethose server --listen 0.0.0.0:4500 --tun ph0 --lanes 4 \
+  --psk "$PSK" --encrypt aes-gcm --allow <client-public-IP>
+
+./packethose client --peer <server-ip>:4500 --tun ph0 --lanes 4 \
+  --psk "$PSK" --encrypt aes-gcm
+```
+
+`aes-gcm` is the right default on modern x86/ARM (AES-NI is everywhere).
+`chacha20` is the fallback for hardware without AES instructions.
+
+### Multi-client server (with server-allocated IPs)
+
+The server runs once. Multiple clients connect, each gets a `/32` from
+a pool, each gets its own kernel TUN on the server side. Sticky
+allocation: the same `client-id` (random per-process) gets the same IP
+on reconnect.
+
+```bash
+# server (one instance, handles all clients)
+./packethose server --listen 0.0.0.0:4500 \
+  --subnet 10.66.0.0/24 --server-ip 10.66.0.1 \
+  --psk "$PSK" --encrypt aes-gcm --vnet_hdr
+
+# enable forwarding + masq
+sysctl -w net.ipv4.ip_forward=1
+iptables -t nat -A POSTROUTING -s 10.66.0.0/24 ! -d 10.66.0.0/24 -j MASQUERADE
+iptables -A FORWARD -s 10.66.0.0/24 -j ACCEPT
+iptables -A FORWARD -d 10.66.0.0/24 -j ACCEPT
+```
+
+```bash
+# client (just opt into auto-IP — server assigns)
+ip tuntap add ph0 mode tun multi_queue
+./packethose client --peer <server-ip>:4500 --tun ph0 --lanes 4 \
+  --psk "$PSK" --encrypt aes-gcm --auto-ip
+```
+
+`--auto-ip` configures `ph0` with whatever address the server allocates.
+The first client to connect gets `10.66.0.2`, the second `10.66.0.3`,
+and so on. Reconnecting clients get the same IP they had before (sticky
+by client-id) until the session is GC'd (~90s idle).
+
+To request a specific address from the pool, pass `--request-ip
+10.66.0.10`. The server honors it if free; otherwise gives the next
+available.
+
+## IPv6
+
+The inner traffic is L3-agnostic — packethose ships whatever the kernel
+puts on the TUN, IPv4 or IPv6, single-stack or dual-stack. Just assign
+both families to the TUN:
+
+```bash
+ip tuntap add ph0 mode tun multi_queue
+ip link set ph0 up
+ip addr add 10.66.0.2/24 dev ph0
+ip -6 addr add fd00:66::2/64 dev ph0
+```
+
+The outer lane TCPs can be either family. Bind the server on
+`[::]:4500` to accept both, or on `0.0.0.0:4500` for v4-only:
+
+```bash
+# server, dual-stack listener
+./packethose server --listen "[::]:4500" --tun ph0 --lanes 4 \
+  --psk "$PSK" --encrypt aes-gcm
+
+# client over IPv6 outer
+./packethose client --peer "[2001:db8::1]:4500" --tun ph0 --lanes 4 \
+  --psk "$PSK" --encrypt aes-gcm
+
+# client over IPv4 outer to the same dual-stack server (also works)
+./packethose client --peer 192.0.2.1:4500 --tun ph0 --lanes 4 \
+  --psk "$PSK" --encrypt aes-gcm
+```
+
+Multi-client mode currently allocates from an IPv4 `/24` pool only;
+IPv6 prefix allocation is a future addition. In single-peer setups
+v6 works fully today on both inner and outer.
 
 ## Flags
 
@@ -77,23 +170,157 @@ both peers, and `--allow <client-IP>` on the server.
 |---|---|---|
 | `--listen` (server) | `0.0.0.0:4500` | TCP listen `addr:port`. Use `[::]:port` for IPv6. |
 | `--peer` (client) | (required) | TCP server `addr:port`. Use `[v6]:port` for IPv6. |
-| `--tun` | `tun0` | TUN device name (created if absent). |
-| `--lanes` | 2 | Parallel TCP connections. Inner flows hash to a lane. |
-| `--psk` | (empty) | Pre-shared key hex (>= 16 bytes). Empty disables handshake. |
+| `--tun` | `ph0` | TUN device name (multi-queue, created if absent). |
+| `--lanes` | 4 | Parallel TCP connections. Inner flows hash to a lane. |
+| `--psk` | (empty) | Pre-shared key hex (>= 16 bytes). Empty = no handshake. |
+| `--encrypt` | `none` | AEAD: `none`, `aes-gcm`, `chacha20`. Requires `--psk`. |
 | `--allow` (server) | (empty) | Restrict accept to one source IP. |
-| `--mptcp` | false | Enable MPTCP on the outer sockets. |
-| `--vnet_hdr` | false | Use IFF_VNET_HDR passthrough (low-MTU big win). |
-| `--encrypt` | none | AEAD cipher: `none`, `aes-gcm`, `chacha20`. Requires `--psk`. |
+| `--vnet_hdr` | on | IFF_VNET_HDR for kernel GRO/GSO batching. |
+| `--mptcp` | off | Enable MPTCP on the outer sockets. |
+| `--brutal_mbps` | 0 | If non-zero, install tcp-brutal CC on lanes at this rate. |
+| `--subnet` (server) | (empty) | Multi-client mode: CIDR pool, e.g. `10.66.0.0/24`. Requires `--psk`. |
+| `--server-ip` (server) | (empty) | Server's tunnel IP, e.g. `10.66.0.1`. Required with `--subnet`. |
+| `--tun-prefix` (server) | `phose` | Per-client TUN name prefix in multi-client mode. |
+| `--request-ip` (client) | (empty) | Preferred address from a multi-client server's pool. |
+| `--auto-ip` (client) | off | Apply the server-assigned IP to the local TUN automatically. |
+
+## Wire protocol
+
+### Default mode
+```
+[uint16 BE length][raw L3 packet][uint16 BE length][raw L3 packet]...
+```
+
+### `--vnet_hdr` mode (default)
+```
+[uint16 BE length][virtio_net_hdr (10 bytes, LE fields)][L3 packet]
+```
+Length includes the 10-byte vnet_hdr. The vnet_hdr carries GSO
+metadata so the receiver can pass coalesced super-packets to the
+kernel and let it segment on egress. Both peers must agree.
+
+### Encryption (`--encrypt aes-gcm|chacha20`)
+Each frame is wrapped by AEAD:
+```
+[uint16 BE length][AEAD ciphertext+tag]
+```
+Length is the ciphertext + 16-byte tag length. Nonce is a per-lane
+per-direction 64-bit counter; TCP keeps the endpoints in lockstep so
+the counter does not appear on the wire.
+
+### Handshake (when `--psk` is set, wire version 3)
+```
+client -> magic "PHOS"(4) || ver(1)=3 || cipher(1) || nonce_c(32)
+       || client_id(16) || lane_count(1) || requested_ip(4)
+server -> magic || ver || cipher || HMAC(psk, ver||cipher||nonce_c||client_id||lane_count||req_ip)(32)
+       || nonce_s(32) || assigned_ip(4) || prefix(1) || peer_ip(4)
+client -> HMAC(psk, ver||cipher||nonce_s||assigned_ip||prefix||peer_ip)(32)
+```
+Per-direction session keys are derived via HKDF-SHA256 over `(psk,
+nonce_c || nonce_s)`. `assigned_ip` is non-zero only in multi-client
+mode; single-peer servers leave it zero and the client uses its
+locally configured address.
+
+## Always-on behaviour
+
+Each lane runs under a supervisor that owns the TUN queue fd for the
+lifetime of the process and cycles outer TCP sockets beneath it. On
+any I/O error the connection is closed and reacquired with
+exponential backoff (250 ms doubling to 30 s, jittered). TCP
+keepalive (`TCP_KEEPIDLE=15s`, `TCP_KEEPINTVL=5s`, `TCP_KEEPCNT=3`)
+turns silent network outages into RSTs in ~30 s rather than waiting
+hours for the kernel default.
+
+This means the tunnel feels like an ipip-style point-to-point: the
+TUN interface stays up the whole time; when the peer goes away
+packets drop on the floor; when the peer returns the lane reconnects
+on its own. The process never exits of its own accord.
+
+## tcp-brutal
+
+If the [tcp-brutal](https://github.com/apernet/tcp-brutal) kernel
+module is loaded on both endpoints, set `--brutal_mbps N` on both
+sides to make each outer lane TCP run at a fixed rate of N Mbps.
+Useful on lossy paths where standard CC backs off too aggressively.
+
+## mihopium / mihomo integration
+
+packethose ships as a Go library
+(`github.com/cmspam/packethose`) plus a CLI. The mihomo fork
+[mihopium](https://github.com/cmspam/mihopium) imports it as a proxy
+adapter:
+
+```yaml
+proxies:
+  - name: tokyo
+    type: packethose
+    server: 1.2.3.4
+    port: 4500
+    lanes: 4
+    psk: <hex>
+    cipher: aes-gcm
+    mtu: 1500
+    # mode: native    # default: real kernel TUN, kernel-rate
+    # mode: userspace # alternative: gVisor netstack, no CAP_NET_ADMIN needed
+    # interface-name: ph-tokyo
+```
+
+In `native` mode the adapter creates a real kernel TUN per proxy,
+configures the server-assigned IP on it, and binds outbound sockets
+to that interface via `SO_BINDTODEVICE`. Throughput approaches the
+direct path (~96% in benchmarks).
+
+In `userspace` mode the adapter runs a gVisor netstack in-process,
+no kernel TUN needed. Slower (userspace TCP/IP), but useful when
+running many packethose proxies on one host or in restricted
+environments.
+
+The `dialer-proxy` field on the outbound is honored: lane TCPs dial
+through whatever mihomo chains them through.
+
+## Container image
+
+```bash
+docker pull ghcr.io/cmspam/packethose:latest
+docker run --rm --network host --cap-add NET_ADMIN \
+  ghcr.io/cmspam/packethose:latest \
+  server --listen 0.0.0.0:4500 --tun ph0 --lanes 4
+```
+
+Multi-arch: `linux/amd64`, `linux/arm64`.
 
 ## Performance
 
-| Path | MTU | Mode | Throughput |
-|---|---|---|---|
-| LAN (dp ↔ lw) | 1500 | `--vnet_hdr`, plain | 4.38 Gbps (8 stream) |
-| LAN | 1500 | `--vnet_hdr` + aes-gcm | 2.88 Gbps |
-| LAN | 1500 | `--vnet_hdr` + chacha20 | 1.96 Gbps |
-| Internet (~9 ms) | 1500 | `--vnet_hdr`, plain | ~600 Mbps real-world |
-| Internet | 1500 | `--vnet_hdr` + aes-gcm | ~600 Mbps real-world |
+All numbers below are from a single cloud-host pair on the same
+provider's internal network. Your path will differ; the point is
+the relative cost of each option, not the absolute throughput.
 
-`aes-gcm` is preferred when both endpoints have AES-NI (every modern
-x86/ARM CPU); `chacha20` is the fallback for hardware without it.
+Linux x86_64, MTU 1500, 8 iperf3 streams, 2 lanes:
+
+| Configuration | Throughput |
+|---|---:|
+| baseline (no PSK, no encryption) | ~4.4 Gbps |
+| PSK only (handshake, plaintext) | ~4.3 Gbps |
+| PSK + AES-128-GCM | ~2.9 Gbps |
+| PSK + ChaCha20-Poly1305 | ~2.0 Gbps |
+
+AES-GCM costs roughly a third of the plaintext rate at this LAN
+speed; ChaCha20 about half. Both run well above 1 Gbps single-core
+on any modern x86 or ARM CPU, so on real internet paths (typically
+a few hundred Mbps per flow) the crypto cost is invisible.
+
+A mihopium adapter running on the kernel-TUN backend (`mode: native`)
+reaches ~96% of the direct (non-tunnel) HTTPS download rate to the
+same destination with AES-GCM enabled.
+
+Multi-client server, two concurrent clients, AES-GCM, 4 lanes each:
+
+| Client | Throughput |
+|---|---:|
+| client 1 → server | ~2.5 Gbps |
+| client 2 → server | ~2.6 Gbps |
+| aggregate through one server | ~5.1 Gbps |
+
+## License
+
+MIT.

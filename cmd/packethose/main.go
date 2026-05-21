@@ -51,8 +51,8 @@ Server-only:
   --allow IP           accept only from this source IP
 
 Bring the TUN interface up + assign addresses externally:
-  ip link set tun0 up
-  ip addr add 10.55.0.1/24 dev tun0
+  ip link set ph0 up
+  ip addr add 10.55.0.1/24 dev ph0
 `)
 }
 
@@ -67,7 +67,7 @@ type commonFlags struct {
 }
 
 func bindCommon(fs *flag.FlagSet, c *commonFlags) {
-	fs.StringVar(&c.tun, "tun", "tun0", "TUN device name (multi-queue)")
+	fs.StringVar(&c.tun, "tun", "ph0", "TUN device name (multi-queue)")
 	fs.IntVar(&c.lanes, "lanes", 4, "number of parallel TCP lanes")
 	fs.StringVar(&c.pskHex, "psk", "", "pre-shared key (hex). empty = no handshake")
 	fs.BoolVar(&c.mptcp, "mptcp", false, "enable MPTCP on outer sockets")

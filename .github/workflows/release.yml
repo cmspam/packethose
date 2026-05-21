@@ -1,0 +1,267 @@
+# Packethose release workflow.
+#
+# Change-driven: a release happens when main HEAD has advanced past
+# the last release tag. workflow_dispatch always proceeds.
+#
+# Two-stage multi-arch build:
+#   1. `build` matrix — one per architecture on a native runner
+#      (ubuntu-latest for amd64, ubuntu-24.04-arm for arm64). Each
+#      builds the Dockerfile natively, pushes the image by-digest
+#      to GHCR, and uploads the extracted static binary as an
+#      artifact.
+#   2. `release` — waits on both arches. Assembles a single
+#      multi-arch manifest via `docker buildx imagetools create`
+#      (tags :latest, :<YYYYMMDD>, :<YYYYMM>). Downloads both
+#      binaries, generates release notes, tags the commit, and
+#      cuts the GitHub Release.
+#
+# No QEMU. Native runners make arm64 builds as fast as amd64.
+
+name: release
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: packethose-release
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  decide:
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    outputs:
+      release: ${{ steps.guard.outputs.release }}
+      version: ${{ steps.version.outputs.version }}
+      year_month: ${{ steps.version.outputs.year_month }}
+      image_repo: ${{ steps.image.outputs.repo }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Guard against same-commit re-release
+        id: guard
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "release=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if git tag --points-at HEAD | grep -E '^[0-9]{8}(\.[0-9]+)?$' >/dev/null; then
+            echo "HEAD already tagged; skipping"
+            echo "release=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "release=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Compute version
+        if: steps.guard.outputs.release == 'true'
+        id: version
+        run: |
+          set -euo pipefail
+          DATE=$(date -u +%Y%m%d)
+          git fetch --tags --quiet
+          if git rev-parse "$DATE" >/dev/null 2>&1; then
+            N=1
+            while git rev-parse "${DATE}.${N}" >/dev/null 2>&1; do N=$((N+1)); done
+            VERSION="${DATE}.${N}"
+          else
+            VERSION="$DATE"
+          fi
+          echo "version=$VERSION"             >> "$GITHUB_OUTPUT"
+          echo "year_month=$(date -u +%Y%m)"  >> "$GITHUB_OUTPUT"
+
+      - name: Image namespace (lowercased)
+        if: steps.guard.outputs.release == 'true'
+        id: image
+        run: |
+          OWNER_LC=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
+          echo "repo=ghcr.io/$OWNER_LC/packethose" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: decide
+    if: needs.decide.outputs.release == 'true'
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-latest
+            arch: amd64
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+            arch: arm64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push by-digest
+        id: build
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: Dockerfile
+          platforms: ${{ matrix.platform }}
+          build-args: |
+            VERSION=${{ needs.decide.outputs.version }}
+          outputs: type=image,name=${{ needs.decide.outputs.image_repo }},push-by-digest=true,name-canonical=true,push=true
+          labels: |
+            org.opencontainers.image.title=packethose
+            org.opencontainers.image.description=Framed-IP-over-TCP multi-lane tunnel
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ needs.decide.outputs.version }}
+          cache-from: type=registry,ref=${{ needs.decide.outputs.image_repo }}:buildcache-${{ matrix.arch }}
+          cache-to: type=registry,ref=${{ needs.decide.outputs.image_repo }}:buildcache-${{ matrix.arch }},mode=max
+
+      - name: Export digest for the manifest assemble
+        run: |
+          mkdir -p digests
+          digest="${{ steps.build.outputs.digest }}"
+          touch "digests/${digest#sha256:}"
+
+      - name: Upload digest artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: digest-${{ matrix.arch }}
+          path: digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Extract binary from the just-built image
+        run: |
+          set -euo pipefail
+          digest="${{ steps.build.outputs.digest }}"
+          ref="${{ needs.decide.outputs.image_repo }}@$digest"
+          docker pull "$ref"
+          CID=$(docker create "$ref")
+          mkdir -p out
+          docker cp "$CID:/usr/local/bin/packethose" "out/packethose-linux-${{ matrix.arch }}"
+          docker rm "$CID" >/dev/null
+          chmod +x "out/packethose-linux-${{ matrix.arch }}"
+          ls -la out
+
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: binary-${{ matrix.arch }}
+          path: out/packethose-linux-${{ matrix.arch }}
+          if-no-files-found: error
+          retention-days: 1
+
+  release:
+    needs: [decide, build]
+    if: needs.decide.outputs.release == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Configure git identity
+        run: |
+          git config user.name "cmspam"
+          git config user.email "cmspam@users.noreply.github.com"
+
+      - name: Download all digests
+        uses: actions/download-artifact@v8
+        with:
+          pattern: digest-*
+          path: digests
+          merge-multiple: true
+
+      - name: Download all binaries
+        uses: actions/download-artifact@v8
+        with:
+          pattern: binary-*
+          path: out
+          merge-multiple: true
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Assemble multi-arch manifest
+        working-directory: digests
+        run: |
+          set -euo pipefail
+          REPO="${{ needs.decide.outputs.image_repo }}"
+          VERSION="${{ needs.decide.outputs.version }}"
+          YYYYMM="${{ needs.decide.outputs.year_month }}"
+          SOURCES=()
+          for f in *; do
+            SOURCES+=("$REPO@sha256:$f")
+          done
+          docker buildx imagetools create \
+            -t "$REPO:$VERSION" \
+            -t "$REPO:latest" \
+            -t "$REPO:$YYYYMM" \
+            "${SOURCES[@]}"
+          docker buildx imagetools inspect "$REPO:$VERSION"
+
+      - name: Build release notes
+        id: notes
+        run: |
+          set -euo pipefail
+          PREV=$(git tag --sort=-creatordate | grep -E '^[0-9]{8}(\.[0-9]+)?$' | head -1 || true)
+          REPO="${{ needs.decide.outputs.image_repo }}"
+          VERSION="${{ needs.decide.outputs.version }}"
+          {
+            echo "Container image: \`${REPO}:${VERSION}\` (linux/amd64, linux/arm64)"
+            echo
+            echo "Also tagged: \`latest\`, \`${{ needs.decide.outputs.year_month }}\`."
+            echo
+            if [ -n "$PREV" ]; then
+              echo "## Changes since \`$PREV\`"
+              echo
+              git log --pretty=format:'- %s' "$PREV..HEAD" || true
+              echo
+            else
+              echo "## Initial release"
+              echo
+              echo "First public build."
+            fi
+          } > notes.md
+          cat notes.md
+
+      - name: Tag the commit
+        run: |
+          set -euo pipefail
+          git tag -a "${{ needs.decide.outputs.version }}" -m "packethose ${{ needs.decide.outputs.version }}"
+          git push origin "${{ needs.decide.outputs.version }}"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ needs.decide.outputs.version }}
+          name: packethose ${{ needs.decide.outputs.version }}
+          body_path: notes.md
+          fail_on_unmatched_files: true
+          files: |
+            out/packethose-linux-amd64
+            out/packethose-linux-arm64
