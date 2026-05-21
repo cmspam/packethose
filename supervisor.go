@@ -20,16 +20,33 @@ const (
 // backoff).
 type connSource func(ctx context.Context) (net.Conn, laneIdentity, error)
 
-// onAssigned is invoked on the FIRST successful handshake from a supervisor's
-// lane if the server returned a non-zero assigned IP. It is called at most
-// once per supervisor lifetime.
-type onAssigned func(assigned netip.Addr, peer netip.Addr, prefix byte)
+// Assignment carries the server's tunnel-address assignment for one client.
+// A family with Prefix == 0 means the server did not assign that family.
+type Assignment struct {
+	V4Addr   netip.Addr
+	V4Prefix byte
+	V4Peer   netip.Addr
+
+	V6Addr   netip.Addr
+	V6Prefix byte
+	V6Peer   netip.Addr
+}
+
+// HasV4 reports whether the assignment includes an IPv4 address.
+func (a Assignment) HasV4() bool { return a.V4Prefix != 0 && a.V4Addr.IsValid() }
+
+// HasV6 reports whether the assignment includes an IPv6 address.
+func (a Assignment) HasV6() bool { return a.V6Prefix != 0 && a.V6Addr.IsValid() }
+
+// onAssignedFn is invoked at most once per supervisor lifetime when the server
+// returns any assignment (v4, v6, or both).
+type onAssignedFn func(Assignment)
 
 // runSupervised owns one PacketIO and drives outer connections under it,
 // acquiring -> running I/O -> reacquiring on any failure, with exponential
 // backoff and jitter. The PacketIO stays open for the supervisor's lifetime;
 // outer connections come and go beneath it.
-func runSupervised(ctx context.Context, id int, pio PacketIO, src connSource, extraTune func(net.Conn), onAssign onAssigned, logger *log.Logger) {
+func runSupervised(ctx context.Context, id int, pio PacketIO, src connSource, extraTune func(net.Conn), onAssign onAssignedFn, logger *log.Logger) {
 	backoff := backoffInitial
 	notified := false
 	for {
@@ -51,8 +68,15 @@ func runSupervised(ctx context.Context, id int, pio PacketIO, src connSource, ex
 		backoff = backoffInitial
 		logger.Printf("lane %d: up peer=%s cipher=%s", id, c.RemoteAddr(), ident.keys.kind)
 
-		if !notified && onAssign != nil && ident.prefixLen != 0 {
-			onAssign(ident.assignedIP, ident.peerIP, ident.prefixLen)
+		if !notified && onAssign != nil && ident.hasAssignment() {
+			onAssign(Assignment{
+				V4Addr:   ident.assigned4,
+				V4Prefix: ident.prefix4,
+				V4Peer:   ident.peer4,
+				V6Addr:   ident.assigned6,
+				V6Prefix: ident.prefix6,
+				V6Peer:   ident.peer6,
+			})
 			notified = true
 		}
 
@@ -97,13 +121,13 @@ func sleepJitter(ctx context.Context, d time.Duration) bool {
 // initiate-side handshake. clientID identifies this client; laneCount is the
 // total lanes this client will open (informational on server side). reqIP is
 // the IP the client prefers to be assigned (zero = any).
-func clientSource(peer string, psk []byte, cipher Cipher, dialer ContextDialer, clientID [clientIDLen]byte, laneCount byte, reqIP netip.Addr) connSource {
+func clientSource(peer string, psk []byte, cipher Cipher, dialer ContextDialer, clientID [clientIDLen]byte, laneCount byte, req AssignmentRequest) connSource {
 	return func(ctx context.Context) (net.Conn, laneIdentity, error) {
 		c, err := dialer.DialContext(ctx, "tcp", peer)
 		if err != nil {
 			return nil, laneIdentity{}, err
 		}
-		ident, err := initiateHandshake(c, psk, cipher, clientID, laneCount, reqIP)
+		ident, err := initiateHandshake(c, psk, cipher, clientID, laneCount, req)
 		if err != nil {
 			c.Close()
 			return nil, laneIdentity{}, err

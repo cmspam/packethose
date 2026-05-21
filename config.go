@@ -86,20 +86,22 @@ type ClientConfig struct {
 
 	// ClientID is the 16-byte identifier sent on every lane's handshake.
 	// When the server is in multi-client mode it groups lanes by this ID
-	// and assigns one IP per ID. Zero = NewClient generates a random one.
+	// and assigns addresses per ID. Zero = NewClient generates a random
+	// one.
 	ClientID [clientIDLen]byte
 
-	// RequestIP, if set, is the address the client would like to be
-	// assigned. The server may honor it (sticky behavior across
-	// reconnects) or assign a different one. Zero means "any".
-	RequestIP netip.Addr
+	// RequestIP and RequestIP6, if set, are the IPv4 and/or IPv6 addresses
+	// the client would prefer to be assigned. The server may honor them
+	// (sticky across reconnects) or assign different ones. Either can be
+	// the zero Addr to skip a family.
+	RequestIP  netip.Addr
+	RequestIP6 netip.Addr
 
 	// OnAssigned is invoked once per Client lifetime when the server
-	// returns a non-zero assignment. The callback receives the assigned
-	// address, the server's tunnel address, and the subnet prefix length.
-	// Use it to configure your TUN device or netstack with the assigned
-	// address right after the first lane comes up.
-	OnAssigned func(assigned, peer netip.Addr, prefix byte)
+	// returns any assignment (v4, v6, or both). Use it to configure your
+	// TUN device or netstack with the assigned addresses after the first
+	// lane comes up.
+	OnAssigned func(Assignment)
 
 	// Logger receives lane lifecycle messages. nil = log.Default().
 	Logger *log.Logger
@@ -135,14 +137,18 @@ type ServerConfig struct {
 	// Logger receives lifecycle messages.
 	Logger *log.Logger
 
-	// Subnet, when set, switches the server into multi-client mode: a
-	// MultiClientServer is constructed (Queues is ignored), the listener
-	// allocates a /32 from this prefix per connecting client, and creates
-	// a per-client kernel TUN device. ServerIP must also be set.
-	Subnet netip.Prefix
-	// ServerIP is the host's tunnel-side address (e.g. 10.66.0.1) when
-	// Subnet is set. Reserved from the pool.
-	ServerIP netip.Addr
+	// Subnet (IPv4) and/or Subnet6 (IPv6), when set, switch the server
+	// into multi-client mode: each connecting client is allocated a /32
+	// from Subnet and/or a /128 (hash-derived) from Subnet6, and gets its
+	// own kernel TUN. Either or both may be set; if neither is set, the
+	// server runs the legacy single-client Queues-backed path.
+	Subnet  netip.Prefix
+	Subnet6 netip.Prefix
+	// ServerIP and ServerIP6 are the host's tunnel-side addresses (e.g.
+	// 10.66.0.1 and fd00:66::1). Required for their respective families
+	// when Subnet/Subnet6 is set.
+	ServerIP  netip.Addr
+	ServerIP6 netip.Addr
 	// TUNPrefix is the device-name prefix for per-client TUNs in
 	// multi-client mode (default "phose"). Each client gets
 	// <prefix>-<short-id>.
@@ -174,16 +180,25 @@ func (c ServerConfig) Validate() error {
 	if c.Listen == "" {
 		return errors.New("packethose server: Listen is required")
 	}
-	if c.Subnet.IsValid() {
-		// Multi-client mode: Queues unused, Lanes unused.
+	if c.Subnet.IsValid() || c.Subnet6.IsValid() {
 		if len(c.PSK) == 0 {
 			return errors.New("packethose server: multi-client mode requires PSK")
 		}
-		if !c.ServerIP.IsValid() {
-			return errors.New("packethose server: multi-client mode requires ServerIP")
+		if c.Subnet.IsValid() {
+			if !c.ServerIP.IsValid() || !c.ServerIP.Is4() {
+				return errors.New("packethose server: Subnet requires an IPv4 ServerIP")
+			}
+			if !c.Subnet.Contains(c.ServerIP) {
+				return fmt.Errorf("packethose server: ServerIP %s not in Subnet %s", c.ServerIP, c.Subnet)
+			}
 		}
-		if !c.Subnet.Contains(c.ServerIP) {
-			return fmt.Errorf("packethose server: ServerIP %s not in Subnet %s", c.ServerIP, c.Subnet)
+		if c.Subnet6.IsValid() {
+			if !c.ServerIP6.IsValid() || !c.ServerIP6.Is6() {
+				return errors.New("packethose server: Subnet6 requires an IPv6 ServerIP6")
+			}
+			if !c.Subnet6.Contains(c.ServerIP6) {
+				return fmt.Errorf("packethose server: ServerIP6 %s not in Subnet6 %s", c.ServerIP6, c.Subnet6)
+			}
 		}
 		return nil
 	}

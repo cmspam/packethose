@@ -121,13 +121,17 @@ func runServer(args []string) {
 		allow     string
 		subnet    string
 		serverIP  string
+		subnet6   string
+		serverIP6 string
 		tunPrefix string
 	)
 	bindCommon(fs, &cf)
 	fs.StringVar(&listen, "listen", "0.0.0.0:4500", "TCP listen address")
 	fs.StringVar(&allow, "allow", "", "if set, only accept from this source IP")
-	fs.StringVar(&subnet, "subnet", "", "multi-client subnet (CIDR, e.g. 10.66.0.0/24); requires --psk")
-	fs.StringVar(&serverIP, "server-ip", "", "multi-client tunnel-side server IP (e.g. 10.66.0.1); required with --subnet")
+	fs.StringVar(&subnet, "subnet", "", "multi-client IPv4 subnet (CIDR, e.g. 10.66.0.0/24); requires --psk")
+	fs.StringVar(&serverIP, "server-ip", "", "multi-client tunnel-side IPv4 server IP (required with --subnet)")
+	fs.StringVar(&subnet6, "subnet6", "", "multi-client IPv6 subnet (CIDR, e.g. fd00:66::/64); requires --psk")
+	fs.StringVar(&serverIP6, "server-ip6", "", "multi-client tunnel-side IPv6 server IP (required with --subnet6)")
 	fs.StringVar(&tunPrefix, "tun-prefix", "phose", "device-name prefix for per-client TUNs in multi-client mode")
 	fs.Parse(args)
 
@@ -148,17 +152,34 @@ func runServer(args []string) {
 		TuneSocket: brutalTuner(cf.brutalMbps),
 	}
 
+	multiClient := false
 	if subnet != "" {
 		pref, err := netip.ParsePrefix(subnet)
 		if err != nil {
 			log.Fatalf("--subnet: %v", err)
 		}
 		sIP, err := netip.ParseAddr(serverIP)
-		if err != nil {
-			log.Fatalf("--server-ip: %v", err)
+		if err != nil || !sIP.Is4() {
+			log.Fatalf("--server-ip: must be a valid IPv4 address: %v", err)
 		}
 		cfg.Subnet = pref
 		cfg.ServerIP = sIP
+		multiClient = true
+	}
+	if subnet6 != "" {
+		pref, err := netip.ParsePrefix(subnet6)
+		if err != nil {
+			log.Fatalf("--subnet6: %v", err)
+		}
+		sIP, err := netip.ParseAddr(serverIP6)
+		if err != nil || !sIP.Is6() {
+			log.Fatalf("--server-ip6: must be a valid IPv6 address: %v", err)
+		}
+		cfg.Subnet6 = pref
+		cfg.ServerIP6 = sIP
+		multiClient = true
+	}
+	if multiClient {
 		cfg.TUNPrefix = tunPrefix
 		cfg.VnetHdr = cf.vnetHdr
 	} else {
@@ -189,12 +210,14 @@ func runClient(args []string) {
 		cf      commonFlags
 		peer    string
 		reqIP   string
+		reqIP6  string
 		autoIP  bool
 	)
 	bindCommon(fs, &cf)
 	fs.StringVar(&peer, "peer", "", "TCP peer address:port (required)")
-	fs.StringVar(&reqIP, "request-ip", "", "preferred tunnel IP to ask the server for (multi-client mode)")
-	fs.BoolVar(&autoIP, "auto-ip", false, "apply the server-assigned IP to the TUN device automatically")
+	fs.StringVar(&reqIP, "request-ip", "", "preferred IPv4 to ask the server for (multi-client mode)")
+	fs.StringVar(&reqIP6, "request-ip6", "", "preferred IPv6 to ask the server for (multi-client mode)")
+	fs.BoolVar(&autoIP, "auto-ip", false, "apply the server-assigned IP(s) to the TUN device automatically")
 	fs.Parse(args)
 	if peer == "" {
 		log.Fatalf("--peer is required")
@@ -215,11 +238,17 @@ func runClient(args []string) {
 	}
 	log.Printf("opened %d TUN queues on %s (vnet_hdr=%v)", cf.lanes, ifname, cf.vnetHdr)
 
-	var requestAddr netip.Addr
+	var reqAddr4, reqAddr6 netip.Addr
 	if reqIP != "" {
-		requestAddr, err = netip.ParseAddr(reqIP)
-		if err != nil {
-			log.Fatalf("--request-ip: %v", err)
+		reqAddr4, err = netip.ParseAddr(reqIP)
+		if err != nil || !reqAddr4.Is4() {
+			log.Fatalf("--request-ip: must be an IPv4 address: %v", err)
+		}
+	}
+	if reqIP6 != "" {
+		reqAddr6, err = netip.ParseAddr(reqIP6)
+		if err != nil || !reqAddr6.Is6() {
+			log.Fatalf("--request-ip6: must be an IPv6 address: %v", err)
 		}
 	}
 
@@ -231,17 +260,27 @@ func runClient(args []string) {
 		Cipher:     cipher,
 		MPTCP:      cf.mptcp,
 		TuneSocket: brutalTuner(cf.brutalMbps),
-		RequestIP:  requestAddr,
+		RequestIP:  reqAddr4,
+		RequestIP6: reqAddr6,
 	}
 	if autoIP {
-		clicfg.OnAssigned = func(assigned, peer netip.Addr, prefix byte) {
-			log.Printf("server assigned %s/%d (peer %s); configuring %s", assigned, prefix, peer, ifname)
-			cidr := fmt.Sprintf("%s/%d", assigned.String(), prefix)
+		clicfg.OnAssigned = func(a packethose.Assignment) {
 			if err := exec.Command("ip", "link", "set", ifname, "up").Run(); err != nil {
 				log.Printf("ip link set up: %v", err)
 			}
-			if err := exec.Command("ip", "addr", "replace", cidr, "dev", ifname).Run(); err != nil {
-				log.Printf("ip addr replace: %v", err)
+			if a.HasV4() {
+				cidr := fmt.Sprintf("%s/%d", a.V4Addr.String(), a.V4Prefix)
+				log.Printf("server assigned %s (peer %s); configuring %s", cidr, a.V4Peer, ifname)
+				if err := exec.Command("ip", "addr", "replace", cidr, "dev", ifname).Run(); err != nil {
+					log.Printf("ip addr replace v4: %v", err)
+				}
+			}
+			if a.HasV6() {
+				cidr := fmt.Sprintf("%s/%d", a.V6Addr.String(), a.V6Prefix)
+				log.Printf("server assigned %s (peer %s); configuring %s", cidr, a.V6Peer, ifname)
+				if err := exec.Command("ip", "-6", "addr", "replace", cidr, "dev", ifname).Run(); err != nil {
+					log.Printf("ip addr replace v6: %v", err)
+				}
 			}
 		}
 	}

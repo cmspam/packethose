@@ -5,7 +5,6 @@ import (
 	"crypto/rand"
 	"log"
 	"net"
-	"net/netip"
 	"sync"
 	"time"
 )
@@ -42,12 +41,10 @@ func NewClient(cfg ClientConfig) (*Client, error) {
 }
 
 // ClientID returns the stable 16-byte identifier this client sends on every
-// lane handshake. Generated randomly on NewClient unless ClientConfig.ClientID
-// was set.
+// lane handshake.
 func (cl *Client) ClientID() [clientIDLen]byte { return cl.clientID }
 
-// Run blocks until ctx is canceled. All lane supervisors run in goroutines;
-// Run returns once they have all exited.
+// Run blocks until ctx is canceled.
 func (cl *Client) Run(ctx context.Context) error {
 	dialer := cl.cfg.Dialer
 	if dialer == nil {
@@ -59,18 +56,21 @@ func (cl *Client) Run(ctx context.Context) error {
 		}
 	}
 
-	reqIP := zeroAddrV4()
+	req := AssignmentRequest{}
 	if cl.cfg.RequestIP.IsValid() && cl.cfg.RequestIP.Is4() {
-		reqIP = cl.cfg.RequestIP
+		req.V4 = cl.cfg.RequestIP
+	}
+	if cl.cfg.RequestIP6.IsValid() && cl.cfg.RequestIP6.Is6() {
+		req.V6 = cl.cfg.RequestIP6
 	}
 
-	src := clientSource(cl.cfg.Peer, cl.cfg.PSK, cl.cfg.Cipher, dialer, cl.clientID, byte(cl.cfg.Lanes), reqIP)
+	src := clientSource(cl.cfg.Peer, cl.cfg.PSK, cl.cfg.Cipher, dialer, cl.clientID, byte(cl.cfg.Lanes), req)
 
 	var assignOnce sync.Once
-	onAssign := func(assigned, peer netip.Addr, prefix byte) {
+	onAssign := func(a Assignment) {
 		assignOnce.Do(func() {
 			if cl.cfg.OnAssigned != nil {
-				cl.cfg.OnAssigned(assigned, peer, prefix)
+				cl.cfg.OnAssigned(a)
 			}
 		})
 	}

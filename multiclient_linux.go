@@ -17,35 +17,42 @@ import (
 // multiClientLoop accepts inbound connections, groups them by client ID, and
 // runs each session against a per-client kernel TUN device.
 //
-// Pre-conditions on the server's Linux host:
-//   - CAP_NET_ADMIN to create TUN devices and configure addresses
-//   - net.ipv4.ip_forward=1 if clients should reach the wider internet
-//   - iptables MASQUERADE on the egress interface for the Subnet (or
-//     equivalent nftables rule)
-//
 // Per-client lifecycle:
-//   1. First lane arrives → handshake → pool.Allocate → create TUN with
-//      laneCount queues → configure /<prefix> + assigned addr → add lane.
-//   2. Subsequent lanes match the existing session by client ID and consume
-//      the next free queue.
-//   3. When all lanes are idle for sessionIdle, the session is torn down
-//      (TUN deleted, pool slot released, sticky map updated so the same
-//      client gets the same IP if it reconnects later).
-func multiClientLoop(ctx context.Context, ln net.Listener, cfg ServerConfig, pool *ipPool, logger *log.Logger) error {
+//   1. First lane arrives -> handshake -> per-family pool allocation
+//      (v4 from Subnet, v6 from Subnet6, either or both) -> create TUN with
+//      laneCount queues -> install host routes for the assigned address(es)
+//      -> add lane.
+//   2. Subsequent lanes from the same client match the existing session and
+//      consume the next queue.
+//   3. After all lanes are idle for sessionIdle, the session is collected:
+//      the TUN is deleted, pool slots released, sticky maps keep the
+//      address(es) so the same client gets the same allocation on
+//      reconnect.
+func multiClientLoop(ctx context.Context, ln net.Listener, cfg ServerConfig, pool4, pool6 *ipPool, logger *log.Logger) error {
 	state := &mcState{
 		cfg:      cfg,
-		pool:     pool,
+		pool4:    pool4,
+		pool6:    pool6,
 		logger:   logger,
 		sessions: map[[clientIDLen]byte]*session{},
 	}
-	// Server-side tunnel IP lives on loopback so it is reachable from every
-	// per-client TUN (a packet arriving on phose-XYZ with dst=ServerIP gets
-	// delivered to the local stack via the lo /32 route).
-	serverCIDR := fmt.Sprintf("%s/32", cfg.ServerIP.String())
-	if err := exec.Command("ip", "addr", "replace", serverCIDR, "dev", "lo").Run(); err != nil {
-		logger.Printf("warn: failed to add %s to lo: %v (server tunnel IP may be unreachable)", serverCIDR, err)
-	} else {
-		logger.Printf("server tunnel IP %s installed on lo", serverCIDR)
+	// Server-side tunnel IPs live on loopback so each per-client TUN can
+	// reach them without /24-or-/64 conflicts between sessions.
+	if pool4 != nil {
+		cidr := fmt.Sprintf("%s/32", cfg.ServerIP.String())
+		if err := exec.Command("ip", "addr", "replace", cidr, "dev", "lo").Run(); err != nil {
+			logger.Printf("warn: install %s on lo: %v", cidr, err)
+		} else {
+			logger.Printf("server tunnel v4 IP %s installed on lo", cidr)
+		}
+	}
+	if pool6 != nil {
+		cidr := fmt.Sprintf("%s/128", cfg.ServerIP6.String())
+		if err := exec.Command("ip", "-6", "addr", "replace", cidr, "dev", "lo").Run(); err != nil {
+			logger.Printf("warn: install %s on lo: %v", cidr, err)
+		} else {
+			logger.Printf("server tunnel v6 IP %s installed on lo", cidr)
+		}
 	}
 	go state.gc(ctx)
 
@@ -73,22 +80,21 @@ func multiClientLoop(ctx context.Context, ln net.Listener, cfg ServerConfig, poo
 }
 
 type mcState struct {
-	cfg    ServerConfig
-	pool   *ipPool
-	logger *log.Logger
+	cfg          ServerConfig
+	pool4, pool6 *ipPool
+	logger       *log.Logger
 
 	mu       sync.Mutex
 	sessions map[[clientIDLen]byte]*session
 }
 
 type session struct {
-	id         [clientIDLen]byte
-	assignedIP netip.Addr
-	peerIP     netip.Addr
-	prefixLen  byte
-	tunName    string
-	queues     []PacketIO
-	laneCount  int
+	id        [clientIDLen]byte
+	assigned4 netip.Addr
+	assigned6 netip.Addr
+	tunName   string
+	queues    []PacketIO
+	laneCount int
 
 	mu       sync.Mutex
 	nextLane int
@@ -101,13 +107,29 @@ type session struct {
 }
 
 func (m *mcState) handleConn(ctx context.Context, c net.Conn) {
-	assignFn := func(clientID [clientIDLen]byte, requested netip.Addr) (netip.Addr, netip.Addr, byte) {
-		addr, err := m.pool.Allocate(clientID, requested)
-		if err != nil {
-			m.logger.Printf("ipPool: %v", err)
-			return zeroAddrV4(), zeroAddrV4(), 0
+	assignFn := func(clientID [clientIDLen]byte, req AssignmentRequest) AssignmentResponse {
+		var resp AssignmentResponse
+		if m.pool4 != nil {
+			addr, err := m.pool4.Allocate(clientID, req.V4)
+			if err != nil {
+				m.logger.Printf("ipPool v4: %v", err)
+			} else {
+				resp.V4Addr = addr
+				resp.V4Prefix = byte(m.cfg.Subnet.Bits())
+				resp.V4Peer = m.cfg.ServerIP
+			}
 		}
-		return addr, m.cfg.ServerIP, byte(m.cfg.Subnet.Bits())
+		if m.pool6 != nil {
+			addr, err := m.pool6.Allocate(clientID, req.V6)
+			if err != nil {
+				m.logger.Printf("ipPool v6: %v", err)
+			} else {
+				resp.V6Addr = addr
+				resp.V6Prefix = byte(m.cfg.Subnet6.Bits())
+				resp.V6Peer = m.cfg.ServerIP6
+			}
+		}
+		return resp
 	}
 	ident, err := acceptHandshake(c, m.cfg.PSK, assignFn)
 	if err != nil {
@@ -115,8 +137,8 @@ func (m *mcState) handleConn(ctx context.Context, c net.Conn) {
 		c.Close()
 		return
 	}
-	if !ident.assignedIP.IsValid() || ident.prefixLen == 0 {
-		m.logger.Printf("multi-client requires PSK + IP assignment; rejecting %s", c.RemoteAddr())
+	if !ident.hasAssignment() {
+		m.logger.Printf("multi-client server allocated no address for client; rejecting %s", c.RemoteAddr())
 		c.Close()
 		return
 	}
@@ -128,8 +150,15 @@ func (m *mcState) handleConn(ctx context.Context, c net.Conn) {
 		return
 	}
 	if isNew {
-		m.logger.Printf("session %x: assigned %s/%d (tun %s, lanes=%d)",
-			ident.clientID[:4], ident.assignedIP, ident.prefixLen, sess.tunName, sess.laneCount)
+		var addrs []string
+		if ident.assigned4.IsValid() {
+			addrs = append(addrs, fmt.Sprintf("%s/%d", ident.assigned4, ident.prefix4))
+		}
+		if ident.assigned6.IsValid() {
+			addrs = append(addrs, fmt.Sprintf("%s/%d", ident.assigned6, ident.prefix6))
+		}
+		m.logger.Printf("session %x: assigned %v on %s (lanes=%d)",
+			ident.clientID[:4], addrs, sess.tunName, sess.laneCount)
 	}
 
 	sess.mu.Lock()
@@ -165,8 +194,6 @@ func (m *mcState) acquireSession(parent context.Context, ident laneIdentity) (*s
 		m.mu.Unlock()
 		return s, false, nil
 	}
-	// Build the session under m.mu held so concurrent first lanes from
-	// the same client cooperate on a single TUN creation.
 	laneCount := int(ident.laneCount)
 	if laneCount < 1 {
 		laneCount = 1
@@ -178,31 +205,39 @@ func (m *mcState) acquireSession(parent context.Context, ident laneIdentity) (*s
 	queues, ifname, err := OpenKernelTUN(tunName, laneCount, m.cfg.VnetHdr)
 	if err != nil {
 		m.mu.Unlock()
-		m.pool.Release(ident.clientID)
+		m.releaseAll(ident.clientID)
 		return nil, false, fmt.Errorf("open tun %s: %w", tunName, err)
 	}
-	if err := configureSessionInterface(ifname, ident.assignedIP); err != nil {
+	if err := configureSessionInterface(ifname, ident.assigned4, ident.assigned6); err != nil {
 		closeAll(queues)
 		m.mu.Unlock()
-		m.pool.Release(ident.clientID)
+		m.releaseAll(ident.clientID)
 		return nil, false, fmt.Errorf("configure %s: %w", ifname, err)
 	}
 	ctx, cancel := context.WithCancel(parent)
 	s := &session{
-		id:         ident.clientID,
-		assignedIP: ident.assignedIP,
-		peerIP:     ident.peerIP,
-		prefixLen:  ident.prefixLen,
-		tunName:    ifname,
-		queues:     queues,
-		laneCount:  laneCount,
-		lastSeen:   time.Now(),
-		ctx:        ctx,
-		cancel:     cancel,
+		id:        ident.clientID,
+		assigned4: ident.assigned4,
+		assigned6: ident.assigned6,
+		tunName:   ifname,
+		queues:    queues,
+		laneCount: laneCount,
+		lastSeen:  time.Now(),
+		ctx:       ctx,
+		cancel:    cancel,
 	}
 	m.sessions[ident.clientID] = s
 	m.mu.Unlock()
 	return s, true, nil
+}
+
+func (m *mcState) releaseAll(id [clientIDLen]byte) {
+	if m.pool4 != nil {
+		m.pool4.Release(id)
+	}
+	if m.pool6 != nil {
+		m.pool6.Release(id)
+	}
 }
 
 func (m *mcState) gc(ctx context.Context) {
@@ -263,7 +298,7 @@ func (m *mcState) tearDown(s *session) {
 	s.cancel()
 	closeAll(s.queues)
 	_ = exec.Command("ip", "link", "del", s.tunName).Run()
-	m.pool.Release(s.id)
+	m.releaseAll(s.id)
 	m.logger.Printf("session %x: torn down (tun %s)", s.id[:4], s.tunName)
 }
 
@@ -279,26 +314,27 @@ func tunDeviceName(prefix string, id [clientIDLen]byte) string {
 	}
 	short := hex.EncodeToString(id[:3])
 	name := prefix + "-" + short
-	// Linux IFNAMSIZ is 16 (incl. NUL) → 15 usable chars.
 	if len(name) > 15 {
 		name = name[:15]
 	}
 	return name
 }
 
-func configureSessionInterface(name string, clientAddr netip.Addr) error {
+func configureSessionInterface(name string, addrV4, addrV6 netip.Addr) error {
 	if err := exec.Command("ip", "link", "set", name, "up").Run(); err != nil {
 		return fmt.Errorf("ip link set up: %w", err)
 	}
-	// Install a /32 host route to the client's tunnel IP via this device.
-	// We do NOT assign an address from the subnet to the TUN itself; the
-	// server's tunnel IP lives on lo (so it can serve every client without
-	// per-interface conflicts), and the kernel routes inbound replies to
-	// the client via this /32.
-	route := fmt.Sprintf("%s/32", clientAddr.String())
-	if err := exec.Command("ip", "route", "replace", route, "dev", name).Run(); err != nil {
-		return fmt.Errorf("ip route replace: %w", err)
+	if addrV4.IsValid() {
+		route := fmt.Sprintf("%s/32", addrV4.String())
+		if err := exec.Command("ip", "route", "replace", route, "dev", name).Run(); err != nil {
+			return fmt.Errorf("ip route replace v4: %w", err)
+		}
+	}
+	if addrV6.IsValid() {
+		route := fmt.Sprintf("%s/128", addrV6.String())
+		if err := exec.Command("ip", "-6", "route", "replace", route, "dev", name).Run(); err != nil {
+			return fmt.Errorf("ip route replace v6: %w", err)
+		}
 	}
 	return nil
 }
-

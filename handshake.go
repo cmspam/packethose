@@ -15,37 +15,117 @@ import (
 
 const (
 	hsMagic   uint32 = 0x50484F53 // "PHOS"
-	hsVersion byte   = 3
+	hsVersion byte   = 4          // v4: dual-stack address fields (v4 + v6)
 	hsTimeout        = 5 * time.Second
 	nonceLen         = 32
 	macLen           = 32
 	clientIDLen      = 16
+
+	// On-wire address slot: family(1) || addr(16). family ∈ {0,4,6}.
+	addrSlotLen = 17
 )
 
-// laneIdentity carries the data exchanged by the v3 handshake that the lane
-// supervisors need to know about: the cipher, derived session keys, and (when
-// the server is in multi-client mode) the server-allocated tunnel address.
+// laneIdentity carries what the lane supervisors need: the cipher, derived
+// session keys, the client identity, and (in multi-client mode) the
+// server-assigned tunnel addresses for IPv4 and/or IPv6.
 type laneIdentity struct {
-	keys       laneKeys
-	clientID   [clientIDLen]byte
-	laneCount  byte
-	assignedIP netip.Addr
-	peerIP     netip.Addr
-	prefixLen  byte // 0 = no assignment
+	keys      laneKeys
+	clientID  [clientIDLen]byte
+	laneCount byte
+
+	assigned4 netip.Addr
+	prefix4   byte
+	peer4     netip.Addr
+
+	assigned6 netip.Addr
+	prefix6   byte
+	peer6     netip.Addr
 }
 
-// initiateHandshake (client). With psk==nil and want==CipherNone, no handshake
-// runs. Otherwise v3 runs:
+func (id laneIdentity) hasAssignment() bool {
+	return (id.prefix4 != 0 && id.assigned4.IsValid()) ||
+		(id.prefix6 != 0 && id.assigned6.IsValid())
+}
+
+// encodeAddrSlot returns 17 bytes: family(1) + addr(16). family=0 means
+// "unspecified" and addr is zero-padded.
+func encodeAddrSlot(a netip.Addr) []byte {
+	out := make([]byte, addrSlotLen)
+	switch {
+	case !a.IsValid() || a.IsUnspecified():
+		out[0] = 0
+	case a.Is4():
+		out[0] = 4
+		copy(out[1:5], a.AsSlice())
+	case a.Is6():
+		out[0] = 6
+		copy(out[1:17], a.AsSlice())
+	}
+	return out
+}
+
+func decodeAddrSlot(b []byte) netip.Addr {
+	if len(b) < addrSlotLen {
+		return netip.Addr{}
+	}
+	switch b[0] {
+	case 4:
+		var a [4]byte
+		copy(a[:], b[1:5])
+		return netip.AddrFrom4(a)
+	case 6:
+		var a [16]byte
+		copy(a[:], b[1:17])
+		return netip.AddrFrom16(a)
+	}
+	return netip.Addr{}
+}
+
+// AssignmentRequest is what the client asks for in its handshake.
+type AssignmentRequest struct {
+	V4 netip.Addr // zero / Is4() == false ⇒ no v4 request
+	V6 netip.Addr // zero / Is6() == false ⇒ no v6 request
+}
+
+// AssignmentResponse is what the server returns. A family with prefix == 0
+// means the server did not assign that family.
+type AssignmentResponse struct {
+	V4Addr   netip.Addr
+	V4Prefix byte
+	V4Peer   netip.Addr
+
+	V6Addr   netip.Addr
+	V6Prefix byte
+	V6Peer   netip.Addr
+}
+
+// AssignFunc is the server-side hook that picks per-family addresses for an
+// incoming client. Implementations return zero / 0-prefix to decline a family.
+type AssignFunc func(clientID [clientIDLen]byte, req AssignmentRequest) AssignmentResponse
+
+// Wire layout, v4:
 //
-//   client -> magic(4) ver(1)=3 cipher(1) nonce_c(32) clientID(16) laneCount(1) reqIP(4)
-//   server -> magic(4) ver(1)=3 cipher(1) HMAC(psk, ver||cipher||nonce_c||clientID||laneCount||reqIP)(32)
-//             nonce_s(32) assignedIP(4) prefix(1) peerIP(4)
-//   client -> HMAC(psk, ver||cipher||nonce_s||assignedIP||prefix||peerIP)(32)
+//   client ->
+//     magic(4) || ver(1)=4 || cipher(1) || nonce_c(32)
+//       || client_id(16) || lane_count(1)
+//       || req_v4(17) || req_v6(17)
 //
-// reqIP=0.0.0.0 means "any". assignedIP=0.0.0.0 + prefix=0 means the server
-// is in single-client mode and the client should use its locally configured
-// address.
-func initiateHandshake(c net.Conn, psk []byte, want Cipher, clientID [clientIDLen]byte, laneCount byte, reqIP netip.Addr) (laneIdentity, error) {
+//   server ->
+//     magic(4) || ver(1)=4 || cipher(1)
+//       || HMAC(psk, ver||cipher||nonce_c||client_id||lane_count||req_v4||req_v6)(32)
+//       || nonce_s(32)
+//       || asg_v4(17) || prefix_v4(1) || peer_v4(17)
+//       || asg_v6(17) || prefix_v6(1) || peer_v6(17)
+//
+//   client ->
+//     HMAC(psk, ver||cipher||nonce_s||asg_v4||prefix_v4||peer_v4||asg_v6||prefix_v6||peer_v6)(32)
+
+const (
+	clientMsgLen = 4 + 1 + 1 + nonceLen + clientIDLen + 1 + addrSlotLen + addrSlotLen
+	serverMsgLen = 4 + 1 + 1 + macLen + nonceLen + addrSlotLen + 1 + addrSlotLen + addrSlotLen + 1 + addrSlotLen
+)
+
+func initiateHandshake(c net.Conn, psk []byte, want Cipher, clientID [clientIDLen]byte, laneCount byte, req AssignmentRequest) (laneIdentity, error) {
 	if len(psk) == 0 {
 		if want != CipherNone {
 			return laneIdentity{}, fmt.Errorf("encrypt requires PSK")
@@ -59,23 +139,29 @@ func initiateHandshake(c net.Conn, psk []byte, want Cipher, clientID [clientIDLe
 	if _, err := rand.Read(nonceC[:]); err != nil {
 		return laneIdentity{}, err
 	}
-	reqIP4 := zeroAddrV4()
-	if reqIP.Is4() {
-		reqIP4 = reqIP
-	}
-	hdr := make([]byte, 4+1+1+nonceLen+clientIDLen+1+4)
-	binary.BigEndian.PutUint32(hdr[0:4], hsMagic)
-	hdr[4] = hsVersion
-	hdr[5] = byte(want)
-	copy(hdr[6:6+nonceLen], nonceC[:])
-	copy(hdr[6+nonceLen:6+nonceLen+clientIDLen], clientID[:])
-	hdr[6+nonceLen+clientIDLen] = laneCount
-	copy(hdr[6+nonceLen+clientIDLen+1:], reqIP4.AsSlice())
-	if _, err := c.Write(hdr); err != nil {
+
+	reqV4 := encodeAddrSlot(req.V4)
+	reqV6 := encodeAddrSlot(req.V6)
+
+	msg := make([]byte, clientMsgLen)
+	binary.BigEndian.PutUint32(msg[0:4], hsMagic)
+	msg[4] = hsVersion
+	msg[5] = byte(want)
+	copy(msg[6:6+nonceLen], nonceC[:])
+	off := 6 + nonceLen
+	copy(msg[off:off+clientIDLen], clientID[:])
+	off += clientIDLen
+	msg[off] = laneCount
+	off++
+	copy(msg[off:off+addrSlotLen], reqV4)
+	off += addrSlotLen
+	copy(msg[off:off+addrSlotLen], reqV6)
+
+	if _, err := c.Write(msg); err != nil {
 		return laneIdentity{}, err
 	}
 
-	resp := make([]byte, 4+1+1+macLen+nonceLen+4+1+4)
+	resp := make([]byte, serverMsgLen)
 	if _, err := io.ReadFull(c, resp); err != nil {
 		return laneIdentity{}, err
 	}
@@ -89,16 +175,39 @@ func initiateHandshake(c net.Conn, psk []byte, want Cipher, clientID [clientIDLe
 	if got != want {
 		return laneIdentity{}, fmt.Errorf("handshake: cipher rejected (sent %s, got %s)", want, got)
 	}
-	authIn := concat([]byte{hsVersion, byte(got)}, nonceC[:], clientID[:], []byte{laneCount}, reqIP4.AsSlice())
+	authIn := concat(
+		[]byte{hsVersion, byte(got)},
+		nonceC[:],
+		clientID[:],
+		[]byte{laneCount},
+		reqV4,
+		reqV6,
+	)
 	if !hmac.Equal(hmacSHA256(psk, authIn), resp[6:6+macLen]) {
 		return laneIdentity{}, fmt.Errorf("handshake: server HMAC mismatch")
 	}
-	nonceS := resp[6+macLen : 6+macLen+nonceLen]
-	assignedIPBytes := resp[6+macLen+nonceLen : 6+macLen+nonceLen+4]
-	prefix := resp[6+macLen+nonceLen+4]
-	peerIPBytes := resp[6+macLen+nonceLen+5 : 6+macLen+nonceLen+9]
 
-	cliAuth := concat([]byte{hsVersion, byte(got)}, nonceS, assignedIPBytes, []byte{prefix}, peerIPBytes)
+	pos := 6 + macLen
+	nonceS := resp[pos : pos+nonceLen]
+	pos += nonceLen
+	asgV4Bytes := resp[pos : pos+addrSlotLen]
+	pos += addrSlotLen
+	prefix4 := resp[pos]
+	pos++
+	peerV4Bytes := resp[pos : pos+addrSlotLen]
+	pos += addrSlotLen
+	asgV6Bytes := resp[pos : pos+addrSlotLen]
+	pos += addrSlotLen
+	prefix6 := resp[pos]
+	pos++
+	peerV6Bytes := resp[pos : pos+addrSlotLen]
+
+	cliAuth := concat(
+		[]byte{hsVersion, byte(got)},
+		nonceS,
+		asgV4Bytes, []byte{prefix4}, peerV4Bytes,
+		asgV6Bytes, []byte{prefix6}, peerV6Bytes,
+	)
 	if _, err := c.Write(hmacSHA256(psk, cliAuth)); err != nil {
 		return laneIdentity{}, err
 	}
@@ -107,30 +216,27 @@ func initiateHandshake(c net.Conn, psk []byte, want Cipher, clientID [clientIDLe
 	if err != nil {
 		return laneIdentity{}, err
 	}
-	id := laneIdentity{
+	return laneIdentity{
 		keys:      laneKeys{kind: got, tx: tx, rx: rx},
 		clientID:  clientID,
 		laneCount: laneCount,
-		prefixLen: prefix,
-	}
-	if prefix != 0 {
-		id.assignedIP, _ = netip.AddrFromSlice(assignedIPBytes)
-		id.peerIP, _ = netip.AddrFromSlice(peerIPBytes)
-	}
-	return id, nil
+		assigned4: decodeAddrSlot(asgV4Bytes),
+		prefix4:   prefix4,
+		peer4:     decodeAddrSlot(peerV4Bytes),
+		assigned6: decodeAddrSlot(asgV6Bytes),
+		prefix6:   prefix6,
+		peer6:     decodeAddrSlot(peerV6Bytes),
+	}, nil
 }
 
-// acceptHandshake (server). Mirror of initiateHandshake; uses assignFn to
-// pick the assigned address from the server's IP pool (or zero for
-// single-client servers that pass an assignFn returning zero).
-func acceptHandshake(c net.Conn, psk []byte, assignFn func(clientID [clientIDLen]byte, requested netip.Addr) (assigned, peer netip.Addr, prefix byte)) (laneIdentity, error) {
+func acceptHandshake(c net.Conn, psk []byte, assignFn AssignFunc) (laneIdentity, error) {
 	if len(psk) == 0 {
 		return laneIdentity{}, nil
 	}
 	c.SetDeadline(time.Now().Add(hsTimeout))
 	defer c.SetDeadline(time.Time{})
 
-	hdr := make([]byte, 4+1+1+nonceLen+clientIDLen+1+4)
+	hdr := make([]byte, clientMsgLen)
 	if _, err := io.ReadFull(c, hdr); err != nil {
 		return laneIdentity{}, err
 	}
@@ -145,22 +251,23 @@ func acceptHandshake(c net.Conn, psk []byte, assignFn func(clientID [clientIDLen
 		return laneIdentity{}, fmt.Errorf("handshake: unknown cipher %d", got)
 	}
 	nonceC := hdr[6 : 6+nonceLen]
+	pos := 6 + nonceLen
 	var clientID [clientIDLen]byte
-	copy(clientID[:], hdr[6+nonceLen:6+nonceLen+clientIDLen])
-	laneCount := hdr[6+nonceLen+clientIDLen]
-	reqIPBytes := hdr[6+nonceLen+clientIDLen+1:]
-	reqIP, _ := netip.AddrFromSlice(reqIPBytes)
+	copy(clientID[:], hdr[pos:pos+clientIDLen])
+	pos += clientIDLen
+	laneCount := hdr[pos]
+	pos++
+	reqV4Bytes := hdr[pos : pos+addrSlotLen]
+	pos += addrSlotLen
+	reqV6Bytes := hdr[pos : pos+addrSlotLen]
 
-	var assigned, peer netip.Addr
-	var prefix byte
+	req := AssignmentRequest{
+		V4: decodeAddrSlot(reqV4Bytes),
+		V6: decodeAddrSlot(reqV6Bytes),
+	}
+	var asg AssignmentResponse
 	if assignFn != nil {
-		assigned, peer, prefix = assignFn(clientID, reqIP)
-	}
-	if !assigned.IsValid() {
-		assigned = zeroAddrV4()
-	}
-	if !peer.IsValid() {
-		peer = zeroAddrV4()
+		asg = assignFn(clientID, req)
 	}
 
 	var nonceS [nonceLen]byte
@@ -168,16 +275,37 @@ func acceptHandshake(c net.Conn, psk []byte, assignFn func(clientID [clientIDLen
 		return laneIdentity{}, err
 	}
 
-	resp := make([]byte, 4+1+1+macLen+nonceLen+4+1+4)
+	asgV4 := encodeAddrSlot(asg.V4Addr)
+	peerV4 := encodeAddrSlot(asg.V4Peer)
+	asgV6 := encodeAddrSlot(asg.V6Addr)
+	peerV6 := encodeAddrSlot(asg.V6Peer)
+
+	resp := make([]byte, serverMsgLen)
 	binary.BigEndian.PutUint32(resp[0:4], hsMagic)
 	resp[4] = hsVersion
 	resp[5] = byte(got)
-	authIn := concat([]byte{hsVersion, byte(got)}, nonceC, clientID[:], []byte{laneCount}, reqIPBytes)
+	authIn := concat(
+		[]byte{hsVersion, byte(got)},
+		nonceC, clientID[:],
+		[]byte{laneCount},
+		reqV4Bytes, reqV6Bytes,
+	)
 	copy(resp[6:6+macLen], hmacSHA256(psk, authIn))
-	copy(resp[6+macLen:6+macLen+nonceLen], nonceS[:])
-	copy(resp[6+macLen+nonceLen:6+macLen+nonceLen+4], assigned.AsSlice())
-	resp[6+macLen+nonceLen+4] = prefix
-	copy(resp[6+macLen+nonceLen+5:], peer.AsSlice())
+	pos = 6 + macLen
+	copy(resp[pos:pos+nonceLen], nonceS[:])
+	pos += nonceLen
+	copy(resp[pos:pos+addrSlotLen], asgV4)
+	pos += addrSlotLen
+	resp[pos] = asg.V4Prefix
+	pos++
+	copy(resp[pos:pos+addrSlotLen], peerV4)
+	pos += addrSlotLen
+	copy(resp[pos:pos+addrSlotLen], asgV6)
+	pos += addrSlotLen
+	resp[pos] = asg.V6Prefix
+	pos++
+	copy(resp[pos:pos+addrSlotLen], peerV6)
+
 	if _, err := c.Write(resp); err != nil {
 		return laneIdentity{}, err
 	}
@@ -186,7 +314,12 @@ func acceptHandshake(c net.Conn, psk []byte, assignFn func(clientID [clientIDLen
 	if _, err := io.ReadFull(c, ack); err != nil {
 		return laneIdentity{}, err
 	}
-	cliAuth := concat([]byte{hsVersion, byte(got)}, nonceS[:], assigned.AsSlice(), []byte{prefix}, peer.AsSlice())
+	cliAuth := concat(
+		[]byte{hsVersion, byte(got)},
+		nonceS[:],
+		asgV4, []byte{asg.V4Prefix}, peerV4,
+		asgV6, []byte{asg.V6Prefix}, peerV6,
+	)
 	if !bytes.Equal(hmacSHA256(psk, cliAuth), ack) {
 		return laneIdentity{}, fmt.Errorf("handshake: client HMAC mismatch")
 	}
@@ -196,12 +329,15 @@ func acceptHandshake(c net.Conn, psk []byte, assignFn func(clientID [clientIDLen
 		return laneIdentity{}, err
 	}
 	return laneIdentity{
-		keys:       laneKeys{kind: got, tx: tx, rx: rx},
-		clientID:   clientID,
-		laneCount:  laneCount,
-		assignedIP: assigned,
-		peerIP:     peer,
-		prefixLen:  prefix,
+		keys:      laneKeys{kind: got, tx: tx, rx: rx},
+		clientID:  clientID,
+		laneCount: laneCount,
+		assigned4: asg.V4Addr,
+		prefix4:   asg.V4Prefix,
+		peer4:     asg.V4Peer,
+		assigned6: asg.V6Addr,
+		prefix6:   asg.V6Prefix,
+		peer6:     asg.V6Peer,
 	}, nil
 }
 

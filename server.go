@@ -52,20 +52,28 @@ func (s *Server) Run(ctx context.Context) error {
 	}
 	defer ln.Close()
 
-	if s.cfg.Subnet.IsValid() {
+	if s.cfg.Subnet.IsValid() || s.cfg.Subnet6.IsValid() {
 		if len(s.cfg.PSK) == 0 {
-			return fmt.Errorf("packethose server: multi-client mode (Subnet set) requires PSK")
+			return fmt.Errorf("packethose server: multi-client mode requires PSK")
 		}
-		if !s.cfg.ServerIP.IsValid() {
-			return fmt.Errorf("packethose server: multi-client mode requires ServerIP")
+		var pool4, pool6 *ipPool
+		if s.cfg.Subnet.IsValid() {
+			p, err := newIPPool(s.cfg.Subnet, s.cfg.ServerIP)
+			if err != nil {
+				return fmt.Errorf("packethose server: ipPool v4: %w", err)
+			}
+			pool4 = p
 		}
-		pool, err := newIPPool(s.cfg.Subnet, s.cfg.ServerIP)
-		if err != nil {
-			return fmt.Errorf("packethose server: ipPool: %w", err)
+		if s.cfg.Subnet6.IsValid() {
+			p, err := newIPPool(s.cfg.Subnet6, s.cfg.ServerIP6)
+			if err != nil {
+				return fmt.Errorf("packethose server: ipPool v6: %w", err)
+			}
+			pool6 = p
 		}
-		s.logger.Printf("listening on %s (multi-client subnet=%s server-ip=%s psk=true allow=%s)",
-			s.cfg.Listen, s.cfg.Subnet, s.cfg.ServerIP, s.cfg.AllowIP)
-		return multiClientLoop(ctx, ln, s.cfg, pool, s.logger)
+		s.logger.Printf("listening on %s (multi-client subnet=%s subnet6=%s allow=%s)",
+			s.cfg.Listen, s.cfg.Subnet, s.cfg.Subnet6, s.cfg.AllowIP)
+		return multiClientLoop(ctx, ln, s.cfg, pool4, pool6, s.logger)
 	}
 
 	s.logger.Printf("listening on %s (mptcp=%v psk=%v allow=%s lanes=%d)",
