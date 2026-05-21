@@ -26,6 +26,22 @@ head-of-line blocking, give modern congestion control independent
 windows to work with, and stay fast on lossy or reorder-heavy paths
 where a single UDP/QUIC flow would back off.
 
+Other situations where this shape is useful:
+
+- **UDP-hostile networks.** Restrictive corporate proxies, hotel
+  Wi-Fi, captive portals, mobile carriers shaping or blocking UDP,
+  any environment where TCP/443-shaped traffic flows freely but
+  WireGuard/QUIC/OpenVPN-UDP either gets dropped or rate-limited.
+  Packethose is TCP all the way down; it looks like any other TCP
+  flow to middleboxes.
+- **Combining internet connections (MPTCP).** Pass `--mptcp` and the
+  outer lane sockets become MPTCP. On a host with multiple uplinks
+  (LTE + Wi-Fi, two ISPs, bonded WAN), the kernel transparently
+  spreads each lane across the paths, giving the inner tunnel
+  combined bandwidth and seamless failover without any tunnel-level
+  logic. Pair with `lanes: N` and you can saturate fairly
+  asymmetric paths.
+
 ## Install
 
 ### Container
