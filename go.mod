@@ -1,11 +1,11 @@
 module github.com/cmspam/packethose
 
-go 1.26
+go 1.20
 
 require (
 	github.com/metacubex/gvisor v0.0.0-20251227095601-261ec1326fe8
-	golang.org/x/crypto v0.51.0
-	golang.org/x/sys v0.44.0
+	golang.org/x/crypto v0.33.0
+	golang.org/x/sys v0.30.0
 )
 
 require (

@@ -3,7 +3,7 @@ package packethose
 import (
 	"context"
 	"log"
-	"math/rand/v2"
+	"math/rand"
 	"net"
 	"time"
 )
@@ -73,7 +73,7 @@ func nextBackoff(d time.Duration) time.Duration {
 // sleepJitter blocks for d + up to d/4 random jitter, or until ctx is done.
 // Returns false if the wait was cut short by ctx.
 func sleepJitter(ctx context.Context, d time.Duration) bool {
-	jitter := time.Duration(rand.Int64N(int64(d/4) + 1))
+	jitter := time.Duration(rand.Int63n(int64(d/4) + 1))
 	t := time.NewTimer(d + jitter)
 	defer t.Stop()
 	select {
