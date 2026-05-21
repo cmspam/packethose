@@ -68,10 +68,14 @@ type commonFlags struct {
 
 func bindCommon(fs *flag.FlagSet, c *commonFlags) {
 	fs.StringVar(&c.tun, "tun", "tun0", "TUN device name (multi-queue)")
-	fs.IntVar(&c.lanes, "lanes", 2, "number of parallel TCP lanes")
+	fs.IntVar(&c.lanes, "lanes", 4, "number of parallel TCP lanes")
 	fs.StringVar(&c.pskHex, "psk", "", "pre-shared key (hex). empty = no handshake")
 	fs.BoolVar(&c.mptcp, "mptcp", false, "enable MPTCP on outer sockets")
-	fs.BoolVar(&c.vnetHdr, "vnet_hdr", false, "open TUN with IFF_VNET_HDR for GRO/GSO batching (Linux only)")
+	// vnet_hdr is the fast path on Linux (GRO/GSO super-packets). On by
+	// default; opt out with --vnet_hdr=false for very old kernels lacking
+	// IFF_VNET_HDR support.
+	c.vnetHdr = true
+	fs.BoolVar(&c.vnetHdr, "vnet_hdr", true, "open TUN with IFF_VNET_HDR for GRO/GSO batching (default on, Linux only)")
 	fs.StringVar(&c.encrypt, "encrypt", "none", "AEAD cipher: none|aes-gcm|chacha20 (requires --psk)")
 	fs.IntVar(&c.brutalMbps, "brutal_mbps", 0, "if non-zero, configure tcp-brutal CC on lanes at this Mbps")
 }
