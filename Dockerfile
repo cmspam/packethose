@@ -24,8 +24,7 @@ ARG VERSION=dev
 RUN CGO_ENABLED=0 go build \
     -trimpath \
     -ldflags "-X main.version=${VERSION} -w -s -buildid=" \
-    -o /packethose ./cmd/packethose \
- && file /packethose
+    -o /packethose ./cmd/packethose
 
 FROM docker.io/library/alpine:3.20
 
