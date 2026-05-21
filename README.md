@@ -112,23 +112,33 @@ instructions.
 
 ### Multi-client server with server-allocated IPs
 
-The server runs once. Multiple clients connect, each one receives a
-`/32` from a pool, and each one gets its own kernel TUN on the
-server side. Allocation is sticky: the same `client_id` (random per
-client process) receives the same address on reconnect.
+The server runs once. Multiple clients connect, each one gets its own
+kernel TUN on the server side, and each one receives an address (IPv4,
+IPv6, or both, depending on which subnets the server is configured
+for). Allocation is sticky: the same `client_id` (random per client
+process) gets the same address on reconnect.
 
 ```bash
-# server (one instance handles all clients)
-./packethose server --listen 0.0.0.0:4500 \
-  --subnet 10.66.0.0/24 --server-ip 10.66.0.1 \
+# server (dual-stack pool: hand out one v4 and one v6 to each client)
+./packethose server --listen "[::]:4500" \
+  --subnet  10.66.0.0/24 --server-ip  10.66.0.1 \
+  --subnet6 fd00:66::/64 --server-ip6 fd00:66::1 \
   --psk "$PSK" --encrypt aes-gcm --vnet_hdr
 
-# enable forwarding and masquerade
+# enable forwarding and masquerade for both families
 sysctl -w net.ipv4.ip_forward=1
-iptables -t nat -A POSTROUTING -s 10.66.0.0/24 ! -d 10.66.0.0/24 -j MASQUERADE
-iptables -A FORWARD -s 10.66.0.0/24 -j ACCEPT
-iptables -A FORWARD -d 10.66.0.0/24 -j ACCEPT
+sysctl -w net.ipv6.conf.all.forwarding=1
+iptables  -t nat -A POSTROUTING -s 10.66.0.0/24 ! -d 10.66.0.0/24 -j MASQUERADE
+ip6tables -t nat -A POSTROUTING -s fd00:66::/64 ! -d fd00:66::/64 -j MASQUERADE
+iptables  -A FORWARD -s 10.66.0.0/24 -j ACCEPT
+iptables  -A FORWARD -d 10.66.0.0/24 -j ACCEPT
+ip6tables -A FORWARD -s fd00:66::/64 -j ACCEPT
+ip6tables -A FORWARD -d fd00:66::/64 -j ACCEPT
 ```
+
+`--subnet` and `--subnet6` are independent and either, both, or
+neither may be set. With only one set, the server is single-family
+multi-client. With both, it allocates dual-stack.
 
 ```bash
 # client opts into auto IP. The server assigns; the client configures ph0.
@@ -137,49 +147,53 @@ ip tuntap add ph0 mode tun multi_queue
   --psk "$PSK" --encrypt aes-gcm --auto-ip
 ```
 
-`--auto-ip` configures `ph0` with whatever address the server
-allocates. The first client to connect receives `10.66.0.2`, the
-second `10.66.0.3`, and so on. Reconnecting clients keep the address
-they had before (sticky by `client_id`) until the session is
-collected after about 90 seconds of idle.
+`--auto-ip` configures `ph0` with whichever address(es) the server
+returned. The first v4 client receives `10.66.0.2`, the second
+`10.66.0.3`, and so on. v6 addresses are hash-derived from the
+client_id inside the subnet's host portion, so they spread out across
+the prefix rather than running consecutively. Reconnecting clients
+keep their previous address(es) (sticky by `client_id`) until the
+session is collected after about 90 seconds of idle.
 
-To request a specific address from the pool, pass `--request-ip
-10.66.0.10`. The server honors it if it is free, otherwise it
-returns the next available address.
+To request specific addresses from a pool, pass `--request-ip
+10.66.0.10` and/or `--request-ip6 fd00:66::1234`. The server honors
+each if it is free, otherwise it returns the next available value.
 
 ## IPv6
 
-The inner traffic is L3-agnostic. Packethose ships whatever the kernel
-puts on the TUN, IPv4 or IPv6, single-stack or dual-stack. Assign
-both families to the TUN:
+IPv6 is supported on three independent layers, each opt-in:
 
-```bash
-ip tuntap add ph0 mode tun multi_queue
-ip link set ph0 up
-ip addr add 10.66.0.2/24 dev ph0
-ip -6 addr add fd00:66::2/64 dev ph0
-```
+* **Inner traffic.** The tunnel ships whatever the kernel puts on the
+  TUN. Assign both families to the device and IPv6 flows ride the
+  tunnel alongside IPv4 with no extra configuration:
 
-The outer lane TCPs can be either family. Bind the server on
-`[::]:4500` to accept both, or on `0.0.0.0:4500` for v4 only:
+  ```bash
+  ip tuntap add ph0 mode tun multi_queue
+  ip link set ph0 up
+  ip addr add 10.66.0.2/24 dev ph0
+  ip -6 addr add fd00:66::2/64 dev ph0
+  ```
 
-```bash
-# server, dual-stack listener
-./packethose server --listen "[::]:4500" --tun ph0 --lanes 4 \
-  --psk "$PSK" --encrypt aes-gcm
+* **Outer lane TCPs.** Listen on `[::]:4500` and the server accepts
+  both families; clients can connect over either:
 
-# client over IPv6 outer
-./packethose client --peer "[2001:db8::1]:4500" --tun ph0 --lanes 4 \
-  --psk "$PSK" --encrypt aes-gcm
+  ```bash
+  # client over IPv6 outer
+  ./packethose client --peer "[2001:db8::1]:4500" --tun ph0 --lanes 4 \
+    --psk "$PSK" --encrypt aes-gcm
 
-# client over IPv4 outer to the same dual-stack server (also works)
-./packethose client --peer 192.0.2.1:4500 --tun ph0 --lanes 4 \
-  --psk "$PSK" --encrypt aes-gcm
-```
+  # client over IPv4 outer to the same dual-stack server
+  ./packethose client --peer 192.0.2.1:4500 --tun ph0 --lanes 4 \
+    --psk "$PSK" --encrypt aes-gcm
+  ```
 
-Multi-client mode currently allocates from an IPv4 `/24` pool only.
-IPv6 prefix allocation is a future addition. In single-peer setups,
-v6 works fully today on both inner and outer.
+* **Multi-client pool allocation.** Set `--subnet6`/`--server-ip6` on
+  the server (with or without the IPv4 `--subnet`/`--server-ip`) and
+  the server hands out a `/128` from the IPv6 prefix to each client,
+  derived deterministically from its `client_id` so the spread inside
+  the prefix is uniform and reconnects stick. `--auto-ip` on the
+  client picks up whichever family the server gave it. See the
+  multi-client section above for the full example.
 
 ## Flags
 
@@ -195,11 +209,14 @@ v6 works fully today on both inner and outer.
 | `--vnet_hdr` | on | IFF_VNET_HDR for kernel GRO/GSO batching. |
 | `--mptcp` | off | Enable MPTCP on the outer sockets. |
 | `--brutal_mbps` | 0 | If non-zero, install tcp-brutal CC on lanes at this rate. |
-| `--subnet` (server) | (empty) | Multi-client mode: CIDR pool, e.g. `10.66.0.0/24`. Requires `--psk`. |
-| `--server-ip` (server) | (empty) | Server's tunnel IP, e.g. `10.66.0.1`. Required with `--subnet`. |
+| `--subnet` (server) | (empty) | Multi-client IPv4 pool, e.g. `10.66.0.0/24`. Requires `--psk`. |
+| `--server-ip` (server) | (empty) | Server's IPv4 tunnel address; required with `--subnet`. |
+| `--subnet6` (server) | (empty) | Multi-client IPv6 pool, e.g. `fd00:66::/64`. Requires `--psk`. |
+| `--server-ip6` (server) | (empty) | Server's IPv6 tunnel address; required with `--subnet6`. |
 | `--tun-prefix` (server) | `phose` | Per-client TUN name prefix in multi-client mode. |
-| `--request-ip` (client) | (empty) | Preferred address from a multi-client server's pool. |
-| `--auto-ip` (client) | off | Apply the server-assigned IP to the local TUN automatically. |
+| `--request-ip` (client) | (empty) | Preferred IPv4 from a multi-client server's pool. |
+| `--request-ip6` (client) | (empty) | Preferred IPv6 from a multi-client server's pool. |
+| `--auto-ip` (client) | off | Apply the server-assigned address(es) to the local TUN automatically. |
 
 ## Wire protocol
 
@@ -225,18 +242,24 @@ Length is the ciphertext plus the 16-byte tag. The nonce is a
 per-lane per-direction 64-bit counter. TCP keeps the endpoints in
 lockstep so the counter does not appear on the wire.
 
-### Handshake (when `--psk` is set, wire version 3)
+### Handshake (when `--psk` is set, wire version 4)
+Each address slot on the wire is 17 bytes: a 1-byte family tag (0,
+4, or 6) followed by a 16-byte payload (IPv4 uses the first 4 bytes
+and zero-pads the rest).
 ```
-client -> magic "PHOS"(4) || ver(1)=3 || cipher(1) || nonce_c(32)
-       || client_id(16) || lane_count(1) || requested_ip(4)
-server -> magic || ver || cipher || HMAC(psk, ver||cipher||nonce_c||client_id||lane_count||req_ip)(32)
-       || nonce_s(32) || assigned_ip(4) || prefix(1) || peer_ip(4)
-client -> HMAC(psk, ver||cipher||nonce_s||assigned_ip||prefix||peer_ip)(32)
+client -> magic "PHOS"(4) || ver(1)=4 || cipher(1) || nonce_c(32)
+       || client_id(16) || lane_count(1) || req_v4(17) || req_v6(17)
+server -> magic || ver || cipher
+       || HMAC(psk, ver||cipher||nonce_c||client_id||lane_count||req_v4||req_v6)(32)
+       || nonce_s(32)
+       || asg_v4(17) || prefix_v4(1) || peer_v4(17)
+       || asg_v6(17) || prefix_v6(1) || peer_v6(17)
+client -> HMAC(psk, ver||cipher||nonce_s||asg_v4||prefix_v4||peer_v4||asg_v6||prefix_v6||peer_v6)(32)
 ```
 Per-direction session keys are derived via HKDF-SHA256 over `(psk,
-nonce_c || nonce_s)`. `assigned_ip` is non-zero only in multi-client
-mode. Single-peer servers leave it zero and the client uses its
-locally configured address.
+nonce_c || nonce_s)`. A family's `prefix` is zero when the server
+did not assign that family. Single-peer servers leave both at zero
+and the client uses its locally configured addresses.
 
 ## Always-on behaviour
 
@@ -278,8 +301,10 @@ proxies:
     psk: <hex>
     cipher: aes-gcm
     mtu: 1500
-    # mode: native    # default: real kernel TUN, kernel-rate
-    # mode: userspace # alternative: gVisor netstack, no CAP_NET_ADMIN needed
+    # ip:  10.66.0.10/24      # optional: preferred IPv4 (server may assign)
+    # ip6: fd00:66::10/64     # optional: preferred IPv6 (server may assign)
+    # mode: native            # default: real kernel TUN, kernel-rate
+    # mode: userspace         # alternative: gVisor netstack, no CAP_NET_ADMIN
     # interface-name: ph-tokyo
 ```
 
