@@ -6,6 +6,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"net"
 	"os"
 	"os/signal"
 	"syscall"
@@ -54,12 +55,13 @@ Bring the TUN interface up + assign addresses externally:
 }
 
 type commonFlags struct {
-	tun     string
-	lanes   int
-	pskHex  string
-	mptcp   bool
-	vnetHdr bool
-	encrypt string
+	tun         string
+	lanes       int
+	pskHex      string
+	mptcp       bool
+	vnetHdr     bool
+	encrypt     string
+	brutalMbps  int
 }
 
 func bindCommon(fs *flag.FlagSet, c *commonFlags) {
@@ -69,6 +71,15 @@ func bindCommon(fs *flag.FlagSet, c *commonFlags) {
 	fs.BoolVar(&c.mptcp, "mptcp", false, "enable MPTCP on outer sockets")
 	fs.BoolVar(&c.vnetHdr, "vnet_hdr", false, "open TUN with IFF_VNET_HDR for GRO/GSO batching (Linux only)")
 	fs.StringVar(&c.encrypt, "encrypt", "none", "AEAD cipher: none|aes-gcm|chacha20 (requires --psk)")
+	fs.IntVar(&c.brutalMbps, "brutal_mbps", 0, "if non-zero, configure tcp-brutal CC on lanes at this Mbps")
+}
+
+func brutalTuner(mbps int) func(net.Conn) {
+	if mbps <= 0 {
+		return nil
+	}
+	rate := uint64(mbps) * 1_000_000 / 8
+	return packethose.BrutalTuner(rate, 0, log.Printf)
 }
 
 func parsePSK(s string) []byte {
@@ -124,12 +135,13 @@ func runServer(args []string) {
 	log.Printf("opened %d TUN queues on %s (vnet_hdr=%v)", cf.lanes, ifname, cf.vnetHdr)
 
 	srv, err := packethose.NewServer(packethose.ServerConfig{
-		Listen:  listen,
-		Lanes:   cf.lanes,
-		Queues:  queues,
-		PSK:     psk,
-		AllowIP: allow,
-		MPTCP:   cf.mptcp,
+		Listen:     listen,
+		Lanes:      cf.lanes,
+		Queues:     queues,
+		PSK:        psk,
+		AllowIP:    allow,
+		MPTCP:      cf.mptcp,
+		TuneSocket: brutalTuner(cf.brutalMbps),
 	})
 	if err != nil {
 		log.Fatalf("server: %v", err)
@@ -171,12 +183,13 @@ func runClient(args []string) {
 	log.Printf("opened %d TUN queues on %s (vnet_hdr=%v)", cf.lanes, ifname, cf.vnetHdr)
 
 	cli, err := packethose.NewClient(packethose.ClientConfig{
-		Peer:   peer,
-		Lanes:  cf.lanes,
-		Queues: queues,
-		PSK:    psk,
-		Cipher: cipher,
-		MPTCP:  cf.mptcp,
+		Peer:       peer,
+		Lanes:      cf.lanes,
+		Queues:     queues,
+		PSK:        psk,
+		Cipher:     cipher,
+		MPTCP:      cf.mptcp,
+		TuneSocket: brutalTuner(cf.brutalMbps),
 	})
 	if err != nil {
 		log.Fatalf("client: %v", err)
