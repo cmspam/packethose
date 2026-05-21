@@ -41,9 +41,9 @@ func usage() {
   packethose client --peer ADDR:PORT  --tun NAME --lanes N [--psk HEX] [--mptcp]
 
 Bring the TUN interface up + assign addresses externally:
-  ip link set %s up
-  ip addr add 10.55.0.1/24 dev %s
-`, "tun0", "tun0")
+  ip link set tun0 up
+  ip addr add 10.55.0.1/24 dev tun0
+`)
 }
 
 type commonFlags struct {
@@ -96,14 +96,6 @@ func openLanes(name string, n int, vnetHdr bool) []int {
 	return fds
 }
 
-func dispatchLane(id, tunFd int, c net.Conn, cf *commonFlags, keys laneKeys) {
-	if cf.vnetHdr {
-		runLaneVnetHdr(id, tunFd, c, keys)
-		return
-	}
-	runLane(id, tunFd, c, keys)
-}
-
 // ---- server ----
 
 func runServer(args []string) {
@@ -127,64 +119,38 @@ func runServer(args []string) {
 	if ck != cipherNone && psk == nil {
 		log.Fatalf("--encrypt %s requires --psk", ck)
 	}
+
 	fds := openLanes(cf.tun, cf.lanes, cf.vnetHdr)
+
+	ctx, cancel := signalContext()
+	defer cancel()
 
 	var lc net.ListenConfig
 	if cf.mptcp {
 		lc.SetMultipathTCP(true)
 	}
-	ctx, cancel := signalContext()
-	defer cancel()
 	ln, err := lc.Listen(ctx, "tcp", listen)
 	if err != nil {
 		log.Fatalf("listen %s: %v", listen, err)
 	}
+	defer ln.Close()
 	log.Printf("listening on %s (mptcp=%v psk=%v allow=%s lanes=%d vnet_hdr=%v encrypt=%s)",
 		listen, cf.mptcp, psk != nil, allow, cf.lanes, cf.vnetHdr, ck)
 
-	type accepted struct {
-		c    net.Conn
-		keys laneKeys
-	}
-	conns := make(chan accepted, cf.lanes)
-	go func() {
-		for {
-			c, err := ln.Accept()
-			if err != nil {
-				log.Printf("accept: %v", err)
-				return
-			}
-			if allow != "" {
-				ip := remoteIP(c)
-				if ip != allow {
-					log.Printf("reject %s (allow=%s)", ip, allow)
-					c.Close()
-					continue
-				}
-			}
-			keys, err := acceptHandshake(c, psk)
-			if err != nil {
-				log.Printf("handshake fail from %s: %v", c.RemoteAddr(), err)
-				c.Close()
-				continue
-			}
-			conns <- accepted{c, keys}
-		}
-	}()
+	pool := newServerPool(cf.lanes)
+	go runAcceptLoop(ctx, ln, allow, psk, pool)
 
 	var wg sync.WaitGroup
 	for i := 0; i < cf.lanes; i++ {
-		a := <-conns
-		log.Printf("lane %d up: peer=%s cipher=%s", i, a.c.RemoteAddr(), a.keys.kind)
 		wg.Add(1)
 		i := i
 		go func() {
 			defer wg.Done()
-			dispatchLane(i, fds[i], a.c, &cf, a.keys)
+			runSupervised(ctx, i, fds[i], pool.source(), &cf)
 		}()
 	}
 	wg.Wait()
-	log.Printf("all lanes exited")
+	log.Printf("server exiting")
 }
 
 // ---- client ----
@@ -211,36 +177,29 @@ func runClient(args []string) {
 	if ck != cipherNone && psk == nil {
 		log.Fatalf("--encrypt %s requires --psk", ck)
 	}
+
 	fds := openLanes(cf.tun, cf.lanes, cf.vnetHdr)
+
+	ctx, cancel := signalContext()
+	defer cancel()
 
 	d := &net.Dialer{Timeout: 10 * time.Second}
 	if cf.mptcp {
 		d.SetMultipathTCP(true)
 	}
-
-	ctx, cancel := signalContext()
-	defer cancel()
+	src := clientSource(peer, psk, ck, d)
 
 	var wg sync.WaitGroup
 	for i := 0; i < cf.lanes; i++ {
-		c, err := d.DialContext(ctx, "tcp", peer)
-		if err != nil {
-			log.Fatalf("dial lane %d: %v", i, err)
-		}
-		keys, err := initiateHandshake(c, psk, ck)
-		if err != nil {
-			log.Fatalf("handshake lane %d: %v", i, err)
-		}
-		log.Printf("lane %d up: peer=%s cipher=%s", i, c.RemoteAddr(), keys.kind)
 		wg.Add(1)
-		i, c, k := i, c, keys
+		i := i
 		go func() {
 			defer wg.Done()
-			dispatchLane(i, fds[i], c, &cf, k)
+			runSupervised(ctx, i, fds[i], src, &cf)
 		}()
 	}
 	wg.Wait()
-	log.Printf("all lanes exited")
+	log.Printf("client exiting")
 }
 
 func signalContext() (context.Context, context.CancelFunc) {
