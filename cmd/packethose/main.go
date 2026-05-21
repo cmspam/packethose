@@ -7,7 +7,9 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"net/netip"
 	"os"
+	"os/exec"
 	"os/signal"
 	"syscall"
 
@@ -110,13 +112,19 @@ func signalContext() (context.Context, context.CancelFunc) {
 func runServer(args []string) {
 	fs := flag.NewFlagSet("server", flag.ExitOnError)
 	var (
-		cf     commonFlags
-		listen string
-		allow  string
+		cf        commonFlags
+		listen    string
+		allow     string
+		subnet    string
+		serverIP  string
+		tunPrefix string
 	)
 	bindCommon(fs, &cf)
 	fs.StringVar(&listen, "listen", "0.0.0.0:4500", "TCP listen address")
 	fs.StringVar(&allow, "allow", "", "if set, only accept from this source IP")
+	fs.StringVar(&subnet, "subnet", "", "multi-client subnet (CIDR, e.g. 10.66.0.0/24); requires --psk")
+	fs.StringVar(&serverIP, "server-ip", "", "multi-client tunnel-side server IP (e.g. 10.66.0.1); required with --subnet")
+	fs.StringVar(&tunPrefix, "tun-prefix", "phose", "device-name prefix for per-client TUNs in multi-client mode")
 	fs.Parse(args)
 
 	cipher, err := packethose.ParseCipher(cf.encrypt)
@@ -128,21 +136,38 @@ func runServer(args []string) {
 		log.Fatalf("--encrypt %s requires --psk", cipher)
 	}
 
-	queues, ifname, err := packethose.OpenKernelTUN(cf.tun, cf.lanes, cf.vnetHdr)
-	if err != nil {
-		log.Fatalf("open tun: %v", err)
-	}
-	log.Printf("opened %d TUN queues on %s (vnet_hdr=%v)", cf.lanes, ifname, cf.vnetHdr)
-
-	srv, err := packethose.NewServer(packethose.ServerConfig{
+	cfg := packethose.ServerConfig{
 		Listen:     listen,
-		Lanes:      cf.lanes,
-		Queues:     queues,
 		PSK:        psk,
 		AllowIP:    allow,
 		MPTCP:      cf.mptcp,
 		TuneSocket: brutalTuner(cf.brutalMbps),
-	})
+	}
+
+	if subnet != "" {
+		pref, err := netip.ParsePrefix(subnet)
+		if err != nil {
+			log.Fatalf("--subnet: %v", err)
+		}
+		sIP, err := netip.ParseAddr(serverIP)
+		if err != nil {
+			log.Fatalf("--server-ip: %v", err)
+		}
+		cfg.Subnet = pref
+		cfg.ServerIP = sIP
+		cfg.TUNPrefix = tunPrefix
+		cfg.VnetHdr = cf.vnetHdr
+	} else {
+		queues, ifname, err := packethose.OpenKernelTUN(cf.tun, cf.lanes, cf.vnetHdr)
+		if err != nil {
+			log.Fatalf("open tun: %v", err)
+		}
+		log.Printf("opened %d TUN queues on %s (vnet_hdr=%v)", cf.lanes, ifname, cf.vnetHdr)
+		cfg.Lanes = cf.lanes
+		cfg.Queues = queues
+	}
+
+	srv, err := packethose.NewServer(cfg)
 	if err != nil {
 		log.Fatalf("server: %v", err)
 	}
@@ -157,11 +182,15 @@ func runServer(args []string) {
 func runClient(args []string) {
 	fs := flag.NewFlagSet("client", flag.ExitOnError)
 	var (
-		cf   commonFlags
-		peer string
+		cf      commonFlags
+		peer    string
+		reqIP   string
+		autoIP  bool
 	)
 	bindCommon(fs, &cf)
 	fs.StringVar(&peer, "peer", "", "TCP peer address:port (required)")
+	fs.StringVar(&reqIP, "request-ip", "", "preferred tunnel IP to ask the server for (multi-client mode)")
+	fs.BoolVar(&autoIP, "auto-ip", false, "apply the server-assigned IP to the TUN device automatically")
 	fs.Parse(args)
 	if peer == "" {
 		log.Fatalf("--peer is required")
@@ -182,7 +211,15 @@ func runClient(args []string) {
 	}
 	log.Printf("opened %d TUN queues on %s (vnet_hdr=%v)", cf.lanes, ifname, cf.vnetHdr)
 
-	cli, err := packethose.NewClient(packethose.ClientConfig{
+	var requestAddr netip.Addr
+	if reqIP != "" {
+		requestAddr, err = netip.ParseAddr(reqIP)
+		if err != nil {
+			log.Fatalf("--request-ip: %v", err)
+		}
+	}
+
+	clicfg := packethose.ClientConfig{
 		Peer:       peer,
 		Lanes:      cf.lanes,
 		Queues:     queues,
@@ -190,7 +227,21 @@ func runClient(args []string) {
 		Cipher:     cipher,
 		MPTCP:      cf.mptcp,
 		TuneSocket: brutalTuner(cf.brutalMbps),
-	})
+		RequestIP:  requestAddr,
+	}
+	if autoIP {
+		clicfg.OnAssigned = func(assigned, peer netip.Addr, prefix byte) {
+			log.Printf("server assigned %s/%d (peer %s); configuring %s", assigned, prefix, peer, ifname)
+			cidr := fmt.Sprintf("%s/%d", assigned.String(), prefix)
+			if err := exec.Command("ip", "link", "set", ifname, "up").Run(); err != nil {
+				log.Printf("ip link set up: %v", err)
+			}
+			if err := exec.Command("ip", "addr", "replace", cidr, "dev", ifname).Run(); err != nil {
+				log.Printf("ip addr replace: %v", err)
+			}
+		}
+	}
+	cli, err := packethose.NewClient(clicfg)
 	if err != nil {
 		log.Fatalf("client: %v", err)
 	}

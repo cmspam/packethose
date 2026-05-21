@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"net/netip"
 )
 
 // Cipher selects the AEAD used for per-frame payload protection.
@@ -83,6 +84,23 @@ type ClientConfig struct {
 	// install custom socket options like tcp-brutal (see SetBrutalRate).
 	TuneSocket func(net.Conn)
 
+	// ClientID is the 16-byte identifier sent on every lane's handshake.
+	// When the server is in multi-client mode it groups lanes by this ID
+	// and assigns one IP per ID. Zero = NewClient generates a random one.
+	ClientID [clientIDLen]byte
+
+	// RequestIP, if set, is the address the client would like to be
+	// assigned. The server may honor it (sticky behavior across
+	// reconnects) or assign a different one. Zero means "any".
+	RequestIP netip.Addr
+
+	// OnAssigned is invoked once per Client lifetime when the server
+	// returns a non-zero assignment. The callback receives the assigned
+	// address, the server's tunnel address, and the subnet prefix length.
+	// Use it to configure your TUN device or netstack with the assigned
+	// address right after the first lane comes up.
+	OnAssigned func(assigned, peer netip.Addr, prefix byte)
+
 	// Logger receives lane lifecycle messages. nil = log.Default().
 	Logger *log.Logger
 }
@@ -116,6 +134,22 @@ type ServerConfig struct {
 
 	// Logger receives lifecycle messages.
 	Logger *log.Logger
+
+	// Subnet, when set, switches the server into multi-client mode: a
+	// MultiClientServer is constructed (Queues is ignored), the listener
+	// allocates a /32 from this prefix per connecting client, and creates
+	// a per-client kernel TUN device. ServerIP must also be set.
+	Subnet netip.Prefix
+	// ServerIP is the host's tunnel-side address (e.g. 10.66.0.1) when
+	// Subnet is set. Reserved from the pool.
+	ServerIP netip.Addr
+	// TUNPrefix is the device-name prefix for per-client TUNs in
+	// multi-client mode (default "phose"). Each client gets
+	// <prefix>-<short-id>.
+	TUNPrefix string
+	// VnetHdr enables IFF_VNET_HDR on the per-client TUN devices in
+	// multi-client mode.
+	VnetHdr bool
 }
 
 // Validate returns nil if the config is internally consistent.
@@ -139,6 +173,19 @@ func (c ClientConfig) Validate() error {
 func (c ServerConfig) Validate() error {
 	if c.Listen == "" {
 		return errors.New("packethose server: Listen is required")
+	}
+	if c.Subnet.IsValid() {
+		// Multi-client mode: Queues unused, Lanes unused.
+		if len(c.PSK) == 0 {
+			return errors.New("packethose server: multi-client mode requires PSK")
+		}
+		if !c.ServerIP.IsValid() {
+			return errors.New("packethose server: multi-client mode requires ServerIP")
+		}
+		if !c.Subnet.Contains(c.ServerIP) {
+			return fmt.Errorf("packethose server: ServerIP %s not in Subnet %s", c.ServerIP, c.Subnet)
+		}
+		return nil
 	}
 	if c.Lanes < 1 {
 		return errors.New("packethose server: Lanes must be >= 1")

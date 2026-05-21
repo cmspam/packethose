@@ -5,6 +5,7 @@ import (
 	"log"
 	"math/rand"
 	"net"
+	"net/netip"
 	"time"
 )
 
@@ -14,24 +15,28 @@ const (
 )
 
 // connSource produces a handshake-completed outer connection paired with its
-// session keys. It blocks until a connection is ready, the context is canceled,
-// or a transient error occurs (the supervisor will retry with backoff).
-type connSource func(ctx context.Context) (net.Conn, laneKeys, error)
+// lane identity. It blocks until a connection is ready, the context is
+// canceled, or a transient error occurs (the supervisor will retry with
+// backoff).
+type connSource func(ctx context.Context) (net.Conn, laneIdentity, error)
+
+// onAssigned is invoked on the FIRST successful handshake from a supervisor's
+// lane if the server returned a non-zero assigned IP. It is called at most
+// once per supervisor lifetime.
+type onAssigned func(assigned netip.Addr, peer netip.Addr, prefix byte)
 
 // runSupervised owns one PacketIO and drives outer connections under it,
 // acquiring -> running I/O -> reacquiring on any failure, with exponential
 // backoff and jitter. The PacketIO stays open for the supervisor's lifetime;
 // outer connections come and go beneath it.
-//
-// Cancel ctx to shut the supervisor down. The active outer connection is
-// closed, in-flight I/O unblocks, and the loop returns.
-func runSupervised(ctx context.Context, id int, pio PacketIO, src connSource, extraTune func(net.Conn), logger *log.Logger) {
+func runSupervised(ctx context.Context, id int, pio PacketIO, src connSource, extraTune func(net.Conn), onAssign onAssigned, logger *log.Logger) {
 	backoff := backoffInitial
+	notified := false
 	for {
 		if ctx.Err() != nil {
 			return
 		}
-		c, keys, err := src(ctx)
+		c, ident, err := src(ctx)
 		if err != nil {
 			if ctx.Err() != nil {
 				return
@@ -44,9 +49,13 @@ func runSupervised(ctx context.Context, id int, pio PacketIO, src connSource, ex
 			continue
 		}
 		backoff = backoffInitial
-		logger.Printf("lane %d: up peer=%s cipher=%s", id, c.RemoteAddr(), keys.kind)
+		logger.Printf("lane %d: up peer=%s cipher=%s", id, c.RemoteAddr(), ident.keys.kind)
 
-		// Unblock I/O on shutdown by closing the conn.
+		if !notified && onAssign != nil && ident.prefixLen != 0 {
+			onAssign(ident.assignedIP, ident.peerIP, ident.prefixLen)
+			notified = true
+		}
+
 		ioDone := make(chan struct{})
 		go func() {
 			select {
@@ -56,7 +65,7 @@ func runSupervised(ctx context.Context, id int, pio PacketIO, src connSource, ex
 			}
 		}()
 
-		runLane(pio, c, keys, extraTune, logger)
+		runLane(pio, c, ident.keys, extraTune, logger)
 		close(ioDone)
 		logger.Printf("lane %d: down", id)
 	}
@@ -85,32 +94,34 @@ func sleepJitter(ctx context.Context, d time.Duration) bool {
 }
 
 // clientSource returns a connSource that dials peer over dialer and runs the
-// initiate-side handshake.
-func clientSource(peer string, psk []byte, cipher Cipher, dialer ContextDialer) connSource {
-	return func(ctx context.Context) (net.Conn, laneKeys, error) {
+// initiate-side handshake. clientID identifies this client; laneCount is the
+// total lanes this client will open (informational on server side). reqIP is
+// the IP the client prefers to be assigned (zero = any).
+func clientSource(peer string, psk []byte, cipher Cipher, dialer ContextDialer, clientID [clientIDLen]byte, laneCount byte, reqIP netip.Addr) connSource {
+	return func(ctx context.Context) (net.Conn, laneIdentity, error) {
 		c, err := dialer.DialContext(ctx, "tcp", peer)
 		if err != nil {
-			return nil, laneKeys{}, err
+			return nil, laneIdentity{}, err
 		}
-		keys, err := initiateHandshake(c, psk, cipher)
+		ident, err := initiateHandshake(c, psk, cipher, clientID, laneCount, reqIP)
 		if err != nil {
 			c.Close()
-			return nil, laneKeys{}, err
+			return nil, laneIdentity{}, err
 		}
-		return c, keys, nil
+		return c, ident, nil
 	}
 }
 
-// serverPool is a small queue of accepted+handshaked connections waiting to be
-// claimed by lane supervisors. Lanes are symmetric so any incoming connection
-// can fill any waiting lane slot.
+// serverPool is a small queue of accepted + handshake-validated connections
+// waiting to be claimed by lane supervisors. Single-client servers consume
+// from a single pool; multi-client servers use per-session pools.
 type serverPool struct {
 	ready chan acceptedConn
 }
 
 type acceptedConn struct {
-	c    net.Conn
-	keys laneKeys
+	c     net.Conn
+	ident laneIdentity
 }
 
 func newServerPool(cap int) *serverPool {
@@ -118,12 +129,12 @@ func newServerPool(cap int) *serverPool {
 }
 
 func (p *serverPool) source() connSource {
-	return func(ctx context.Context) (net.Conn, laneKeys, error) {
+	return func(ctx context.Context) (net.Conn, laneIdentity, error) {
 		select {
 		case a := <-p.ready:
-			return a.c, a.keys, nil
+			return a.c, a.ident, nil
 		case <-ctx.Done():
-			return nil, laneKeys{}, ctx.Err()
+			return nil, laneIdentity{}, ctx.Err()
 		}
 	}
 }
@@ -148,14 +159,14 @@ func runAcceptLoop(ctx context.Context, ln net.Listener, allow string, psk []byt
 				continue
 			}
 		}
-		keys, err := acceptHandshake(c, psk)
+		ident, err := acceptHandshake(c, psk, nil)
 		if err != nil {
 			logger.Printf("handshake fail from %s: %v", c.RemoteAddr(), err)
 			c.Close()
 			continue
 		}
 		select {
-		case pool.ready <- acceptedConn{c, keys}:
+		case pool.ready <- acceptedConn{c, ident}:
 		case <-ctx.Done():
 			c.Close()
 			return
