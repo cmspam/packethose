@@ -1,23 +1,23 @@
 # packethose
 
-A framed-IP-over-TCP tunnel: wraps raw IP packets in a 2-byte-length
+A framed-IP-over-TCP tunnel. It wraps raw IP packets in a 2-byte-length
 TCP framing protocol and pairs with a virtual netdev so applications
 see it as a normal interface.
 
-Multi-lane outer connections, optional AEAD encryption, optional
-tcp-brutal congestion control, multi-client server with per-client IP
-assignment, and a userspace gVisor netstack mode for environments
-without CAP_NET_ADMIN. Linux on the kernel-TUN fast path; Go-only and
-portable in userspace mode.
+Features include multi-lane outer connections, optional AEAD
+encryption, optional tcp-brutal congestion control, a multi-client
+server with per-client IP assignment, and a userspace gVisor netstack
+mode for environments without CAP_NET_ADMIN. The kernel-TUN fast path
+is Linux only. Userspace mode is Go-only and portable.
 
 ## Why
 
-A surprising number of cloud / VPS providers cap UDP throughput well
-below their advertised network speed — virtio-net descriptor limits,
-hypervisor offload mismatches, MAP-T BR queues, or just plain
-shaping on UDP that doesn't exist on TCP. The symptom: a 10 Gbps
-"unmetered" port that delivers 200 Mbps of UDP per flow and
-multiple-Gbps of TCP.
+A surprising number of cloud and VPS providers cap UDP throughput well
+below their advertised network speed. Common causes include virtio-net
+descriptor limits, hypervisor offload mismatches, MAP-T BR queues, or
+plain shaping on UDP that does not exist on TCP. The symptom is a 10
+Gbps "unmetered" port that delivers 200 Mbps of UDP per flow and
+multiple Gbps of TCP.
 
 Packethose was written for that case. Wrapping the inner traffic in
 TCP rides the host's TSO/GRO fast path and delivers multi-Gbps where
@@ -28,19 +28,18 @@ where a single UDP/QUIC flow would back off.
 
 Other situations where this shape is useful:
 
-- **UDP-hostile networks.** Restrictive corporate proxies, hotel
-  Wi-Fi, captive portals, mobile carriers shaping or blocking UDP,
-  any environment where TCP/443-shaped traffic flows freely but
-  WireGuard/QUIC/OpenVPN-UDP either gets dropped or rate-limited.
-  Packethose is TCP all the way down; it looks like any other TCP
-  flow to middleboxes.
-- **Combining internet connections (MPTCP).** Pass `--mptcp` and the
-  outer lane sockets become MPTCP. On a host with multiple uplinks
-  (LTE + Wi-Fi, two ISPs, bonded WAN), the kernel transparently
-  spreads each lane across the paths, giving the inner tunnel
-  combined bandwidth and seamless failover without any tunnel-level
-  logic. Pair with `lanes: N` and you can saturate fairly
-  asymmetric paths.
+* **UDP-hostile networks.** Restrictive corporate proxies, hotel
+  Wi-Fi, captive portals, and mobile carriers that shape or block UDP
+  often allow ordinary TCP/443 flows freely while dropping or
+  rate-limiting WireGuard, QUIC, and OpenVPN-UDP. Packethose is TCP
+  all the way down. It looks like any other TCP flow to middleboxes.
+* **Combining internet connections with MPTCP.** Pass `--mptcp` and
+  the outer lane sockets become MPTCP. On a host with multiple
+  uplinks such as LTE and Wi-Fi, two ISPs, or a bonded WAN, the
+  kernel transparently spreads each lane across the available paths.
+  The inner tunnel gets combined bandwidth and seamless failover
+  without any tunnel-level logic. Pair `--mptcp` with `lanes: N` and
+  you can saturate fairly asymmetric paths.
 
 ## Install
 
@@ -55,8 +54,8 @@ docker pull ghcr.io/cmspam/packethose:latest
 ### Binary
 
 Grab `packethose-linux-amd64` or `packethose-linux-arm64` from the
-[releases page](https://github.com/cmspam/packethose/releases).
-Static, no dependencies.
+[releases page](https://github.com/cmspam/packethose/releases). It
+is statically linked and has no runtime dependencies.
 
 ### From source
 
@@ -84,7 +83,7 @@ ip addr add 10.66.0.2/24 dev ph0
 ./packethose client --peer <server-ip>:4500 --tun ph0 --lanes 4
 ```
 
-`ping 10.66.0.1` from the client side, traffic flows through the
+`ping 10.66.0.1` from the client side and traffic flows through the
 tunnel. Add iptables MASQUERADE on the server to route the tunnel
 clients to the internet:
 
@@ -96,7 +95,7 @@ iptables -t nat -A POSTROUTING -s 10.66.0.0/24 -o eth0 -j MASQUERADE
 ### Authenticated and encrypted
 
 ```bash
-# generate a PSK once, share it out-of-band
+# generate a PSK once and share it out of band
 PSK=$(openssl rand -hex 32)
 
 # both sides
@@ -107,23 +106,24 @@ PSK=$(openssl rand -hex 32)
   --psk "$PSK" --encrypt aes-gcm
 ```
 
-`aes-gcm` is the right default on modern x86/ARM (AES-NI is everywhere).
-`chacha20` is the fallback for hardware without AES instructions.
+`aes-gcm` is the right default on modern x86 and ARM since AES-NI is
+everywhere. `chacha20` is the fallback for hardware without AES
+instructions.
 
-### Multi-client server (with server-allocated IPs)
+### Multi-client server with server-allocated IPs
 
-The server runs once. Multiple clients connect, each gets a `/32` from
-a pool, each gets its own kernel TUN on the server side. Sticky
-allocation: the same `client-id` (random per-process) gets the same IP
-on reconnect.
+The server runs once. Multiple clients connect, each one receives a
+`/32` from a pool, and each one gets its own kernel TUN on the
+server side. Allocation is sticky: the same `client_id` (random per
+client process) receives the same address on reconnect.
 
 ```bash
-# server (one instance, handles all clients)
+# server (one instance handles all clients)
 ./packethose server --listen 0.0.0.0:4500 \
   --subnet 10.66.0.0/24 --server-ip 10.66.0.1 \
   --psk "$PSK" --encrypt aes-gcm --vnet_hdr
 
-# enable forwarding + masq
+# enable forwarding and masquerade
 sysctl -w net.ipv4.ip_forward=1
 iptables -t nat -A POSTROUTING -s 10.66.0.0/24 ! -d 10.66.0.0/24 -j MASQUERADE
 iptables -A FORWARD -s 10.66.0.0/24 -j ACCEPT
@@ -131,25 +131,26 @@ iptables -A FORWARD -d 10.66.0.0/24 -j ACCEPT
 ```
 
 ```bash
-# client (just opt into auto-IP — server assigns)
+# client opts into auto IP. The server assigns; the client configures ph0.
 ip tuntap add ph0 mode tun multi_queue
 ./packethose client --peer <server-ip>:4500 --tun ph0 --lanes 4 \
   --psk "$PSK" --encrypt aes-gcm --auto-ip
 ```
 
-`--auto-ip` configures `ph0` with whatever address the server allocates.
-The first client to connect gets `10.66.0.2`, the second `10.66.0.3`,
-and so on. Reconnecting clients get the same IP they had before (sticky
-by client-id) until the session is GC'd (~90s idle).
+`--auto-ip` configures `ph0` with whatever address the server
+allocates. The first client to connect receives `10.66.0.2`, the
+second `10.66.0.3`, and so on. Reconnecting clients keep the address
+they had before (sticky by `client_id`) until the session is
+collected after about 90 seconds of idle.
 
 To request a specific address from the pool, pass `--request-ip
-10.66.0.10`. The server honors it if free; otherwise gives the next
-available.
+10.66.0.10`. The server honors it if it is free, otherwise it
+returns the next available address.
 
 ## IPv6
 
-The inner traffic is L3-agnostic — packethose ships whatever the kernel
-puts on the TUN, IPv4 or IPv6, single-stack or dual-stack. Just assign
+The inner traffic is L3-agnostic. Packethose ships whatever the kernel
+puts on the TUN, IPv4 or IPv6, single-stack or dual-stack. Assign
 both families to the TUN:
 
 ```bash
@@ -160,7 +161,7 @@ ip -6 addr add fd00:66::2/64 dev ph0
 ```
 
 The outer lane TCPs can be either family. Bind the server on
-`[::]:4500` to accept both, or on `0.0.0.0:4500` for v4-only:
+`[::]:4500` to accept both, or on `0.0.0.0:4500` for v4 only:
 
 ```bash
 # server, dual-stack listener
@@ -176,8 +177,8 @@ The outer lane TCPs can be either family. Bind the server on
   --psk "$PSK" --encrypt aes-gcm
 ```
 
-Multi-client mode currently allocates from an IPv4 `/24` pool only;
-IPv6 prefix allocation is a future addition. In single-peer setups
+Multi-client mode currently allocates from an IPv4 `/24` pool only.
+IPv6 prefix allocation is a future addition. In single-peer setups,
 v6 works fully today on both inner and outer.
 
 ## Flags
@@ -188,7 +189,7 @@ v6 works fully today on both inner and outer.
 | `--peer` (client) | (required) | TCP server `addr:port`. Use `[v6]:port` for IPv6. |
 | `--tun` | `ph0` | TUN device name (multi-queue, created if absent). |
 | `--lanes` | 4 | Parallel TCP connections. Inner flows hash to a lane. |
-| `--psk` | (empty) | Pre-shared key hex (>= 16 bytes). Empty = no handshake. |
+| `--psk` | (empty) | Pre-shared key hex (>= 16 bytes). Empty means no handshake. |
 | `--encrypt` | `none` | AEAD: `none`, `aes-gcm`, `chacha20`. Requires `--psk`. |
 | `--allow` (server) | (empty) | Restrict accept to one source IP. |
 | `--vnet_hdr` | on | IFF_VNET_HDR for kernel GRO/GSO batching. |
@@ -220,9 +221,9 @@ Each frame is wrapped by AEAD:
 ```
 [uint16 BE length][AEAD ciphertext+tag]
 ```
-Length is the ciphertext + 16-byte tag length. Nonce is a per-lane
-per-direction 64-bit counter; TCP keeps the endpoints in lockstep so
-the counter does not appear on the wire.
+Length is the ciphertext plus the 16-byte tag. The nonce is a
+per-lane per-direction 64-bit counter. TCP keeps the endpoints in
+lockstep so the counter does not appear on the wire.
 
 ### Handshake (when `--psk` is set, wire version 3)
 ```
@@ -234,7 +235,7 @@ client -> HMAC(psk, ver||cipher||nonce_s||assigned_ip||prefix||peer_ip)(32)
 ```
 Per-direction session keys are derived via HKDF-SHA256 over `(psk,
 nonce_c || nonce_s)`. `assigned_ip` is non-zero only in multi-client
-mode; single-peer servers leave it zero and the client uses its
+mode. Single-peer servers leave it zero and the client uses its
 locally configured address.
 
 ## Always-on behaviour
@@ -242,26 +243,27 @@ locally configured address.
 Each lane runs under a supervisor that owns the TUN queue fd for the
 lifetime of the process and cycles outer TCP sockets beneath it. On
 any I/O error the connection is closed and reacquired with
-exponential backoff (250 ms doubling to 30 s, jittered). TCP
+exponential backoff (250 ms doubling to 30 s, with jitter). TCP
 keepalive (`TCP_KEEPIDLE=15s`, `TCP_KEEPINTVL=5s`, `TCP_KEEPCNT=3`)
-turns silent network outages into RSTs in ~30 s rather than waiting
-hours for the kernel default.
+turns silent network outages into RSTs in about 30 seconds, rather
+than waiting hours for the kernel default.
 
-This means the tunnel feels like an ipip-style point-to-point: the
-TUN interface stays up the whole time; when the peer goes away
-packets drop on the floor; when the peer returns the lane reconnects
-on its own. The process never exits of its own accord.
+In effect, the tunnel feels like an ipip-style point-to-point. The
+TUN interface stays up the whole time. When the peer goes away,
+packets drop on the floor. When the peer returns, the lane
+reconnects on its own. The process never exits of its own accord.
 
 ## tcp-brutal
 
 If the [tcp-brutal](https://github.com/apernet/tcp-brutal) kernel
 module is loaded on both endpoints, set `--brutal_mbps N` on both
 sides to make each outer lane TCP run at a fixed rate of N Mbps.
-Useful on lossy paths where standard CC backs off too aggressively.
+This is useful on lossy paths where standard CC backs off too
+aggressively.
 
-## mihopium / mihomo integration
+## mihopium and mihomo integration
 
-packethose ships as a Go library
+Packethose ships as a Go library
 (`github.com/cmspam/packethose`) plus a CLI. The mihomo fork
 [mihopium](https://github.com/cmspam/mihopium) imports it as a proxy
 adapter:
@@ -284,14 +286,14 @@ proxies:
 In `native` mode the adapter creates a real kernel TUN per proxy,
 configures the server-assigned IP on it, and binds outbound sockets
 to that interface via `SO_BINDTODEVICE`. Throughput approaches the
-direct path (~96% in benchmarks).
+direct path (around 96% in benchmarks).
 
-In `userspace` mode the adapter runs a gVisor netstack in-process,
-no kernel TUN needed. Slower (userspace TCP/IP), but useful when
-running many packethose proxies on one host or in restricted
-environments.
+In `userspace` mode the adapter runs a gVisor netstack in-process.
+No kernel TUN is needed. It is slower since the TCP/IP stack runs in
+userspace, but it is useful when running many packethose proxies on
+one host or in restricted environments.
 
-The `dialer-proxy` field on the outbound is honored: lane TCPs dial
+The `dialer-proxy` field on the outbound is honored. Lane TCPs dial
 through whatever mihomo chains them through.
 
 ## Container image
@@ -308,7 +310,7 @@ Multi-arch: `linux/amd64`, `linux/arm64`.
 ## Performance
 
 All numbers below are from a single cloud-host pair on the same
-provider's internal network. Your path will differ; the point is
+provider's internal network. Your path will differ. The point is
 the relative cost of each option, not the absolute throughput.
 
 Linux x86_64, MTU 1500, 8 iperf3 streams, 2 lanes:
@@ -321,20 +323,21 @@ Linux x86_64, MTU 1500, 8 iperf3 streams, 2 lanes:
 | PSK + ChaCha20-Poly1305 | ~2.0 Gbps |
 
 AES-GCM costs roughly a third of the plaintext rate at this LAN
-speed; ChaCha20 about half. Both run well above 1 Gbps single-core
-on any modern x86 or ARM CPU, so on real internet paths (typically
-a few hundred Mbps per flow) the crypto cost is invisible.
+speed. ChaCha20 costs about half. Both run well above 1 Gbps
+single-core on any modern x86 or ARM CPU, so on real internet paths
+(typically a few hundred Mbps per flow) the crypto cost is
+invisible.
 
-A mihopium adapter running on the kernel-TUN backend (`mode: native`)
-reaches ~96% of the direct (non-tunnel) HTTPS download rate to the
-same destination with AES-GCM enabled.
+A mihopium adapter on the kernel-TUN backend (`mode: native`)
+reaches about 96% of the direct (non-tunnel) HTTPS download rate to
+the same destination with AES-GCM enabled.
 
 Multi-client server, two concurrent clients, AES-GCM, 4 lanes each:
 
 | Client | Throughput |
 |---|---:|
-| client 1 → server | ~2.5 Gbps |
-| client 2 → server | ~2.6 Gbps |
+| client 1 to server | ~2.5 Gbps |
+| client 2 to server | ~2.6 Gbps |
 | aggregate through one server | ~5.1 Gbps |
 
 ## License
