@@ -1,4 +1,4 @@
-package main
+package packethose
 
 import (
 	"bytes"
@@ -20,7 +20,7 @@ const (
 	macLen           = 32
 )
 
-// initiateHandshake (client). With psk==nil and want==cipherNone, no handshake
+// initiateHandshake (client). With psk==nil and want==CipherNone, no handshake
 // runs. Otherwise:
 //
 //   client -> magic(4) ver(1)=2 cipher(1) nonce_c(32)
@@ -28,10 +28,10 @@ const (
 //   client -> HMAC(psk, ver||cipher||nonce_s)(32)
 //
 // Keys (if cipher != none) are derived from HKDF over (psk, nonce_c||nonce_s).
-func initiateHandshake(c net.Conn, psk []byte, want cipherKind) (laneKeys, error) {
+func initiateHandshake(c net.Conn, psk []byte, want Cipher) (laneKeys, error) {
 	if len(psk) == 0 {
-		if want != cipherNone {
-			return laneKeys{}, fmt.Errorf("--encrypt requires --psk")
+		if want != CipherNone {
+			return laneKeys{}, fmt.Errorf("encrypt requires PSK")
 		}
 		return laneKeys{}, nil
 	}
@@ -61,7 +61,7 @@ func initiateHandshake(c net.Conn, psk []byte, want cipherKind) (laneKeys, error
 	if resp[4] != hsVersion {
 		return laneKeys{}, fmt.Errorf("handshake: version mismatch (got %d, want %d)", resp[4], hsVersion)
 	}
-	got := cipherKind(resp[5])
+	got := Cipher(resp[5])
 	if got != want {
 		return laneKeys{}, fmt.Errorf("handshake: cipher rejected (sent %s, got %s)", want, got)
 	}
@@ -102,8 +102,8 @@ func acceptHandshake(c net.Conn, psk []byte) (laneKeys, error) {
 	if hdr[4] != hsVersion {
 		return laneKeys{}, fmt.Errorf("handshake: version mismatch (got %d, want %d)", hdr[4], hsVersion)
 	}
-	got := cipherKind(hdr[5])
-	if got != cipherNone && got != cipherAESGCM && got != cipherChaCha {
+	got := Cipher(hdr[5])
+	if got != CipherNone && got != CipherAESGCM && got != CipherChaCha {
 		return laneKeys{}, fmt.Errorf("handshake: unknown cipher %d", got)
 	}
 	nonceC := hdr[6:]

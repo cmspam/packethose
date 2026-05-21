@@ -1,4 +1,4 @@
-package main
+package packethose
 
 import (
 	"crypto/aes"
@@ -6,71 +6,38 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"errors"
-	"fmt"
 	"io"
 
 	"golang.org/x/crypto/chacha20poly1305"
 	"golang.org/x/crypto/hkdf"
 )
 
-type cipherKind byte
-
-const (
-	cipherNone   cipherKind = 0
-	cipherAESGCM cipherKind = 1
-	cipherChaCha cipherKind = 2
-)
-
-func (c cipherKind) String() string {
+func (c Cipher) keyLen() int {
 	switch c {
-	case cipherNone:
-		return "none"
-	case cipherAESGCM:
-		return "aes-gcm"
-	case cipherChaCha:
-		return "chacha20"
-	}
-	return fmt.Sprintf("unknown(%d)", byte(c))
-}
-
-func parseCipher(s string) (cipherKind, error) {
-	switch s {
-	case "", "none":
-		return cipherNone, nil
-	case "aes-gcm", "aes":
-		return cipherAESGCM, nil
-	case "chacha20", "chacha20-poly1305":
-		return cipherChaCha, nil
-	}
-	return cipherNone, fmt.Errorf("unknown cipher %q (want none|aes-gcm|chacha20)", s)
-}
-
-func (c cipherKind) keyLen() int {
-	switch c {
-	case cipherAESGCM:
+	case CipherAESGCM:
 		return 16
-	case cipherChaCha:
+	case CipherChaCha:
 		return 32
 	}
 	return 0
 }
 
-func (c cipherKind) newAEAD(key []byte) (cipher.AEAD, error) {
+func (c Cipher) newAEAD(key []byte) (cipher.AEAD, error) {
 	switch c {
-	case cipherAESGCM:
+	case CipherAESGCM:
 		blk, err := aes.NewCipher(key)
 		if err != nil {
 			return nil, err
 		}
 		return cipher.NewGCM(blk)
-	case cipherChaCha:
+	case CipherChaCha:
 		return chacha20poly1305.New(key)
 	}
 	return nil, errors.New("no cipher")
 }
 
 type laneKeys struct {
-	kind cipherKind
+	kind Cipher
 	tx   []byte
 	rx   []byte
 }
@@ -78,7 +45,7 @@ type laneKeys struct {
 // deriveSessionKeys runs HKDF-SHA256 with salt = nonceC || nonceS to produce
 // two distinct keys (one per direction). asServer swaps which is local-tx so
 // both peers agree on the wire direction.
-func deriveSessionKeys(psk, nonceC, nonceS []byte, c cipherKind, asServer bool) (tx, rx []byte, err error) {
+func deriveSessionKeys(psk, nonceC, nonceS []byte, c Cipher, asServer bool) (tx, rx []byte, err error) {
 	kl := c.keyLen()
 	if kl == 0 {
 		return nil, nil, nil
@@ -110,7 +77,7 @@ type frameAEAD struct {
 	nonce   [12]byte
 }
 
-func newFrameAEAD(c cipherKind, key []byte) (*frameAEAD, error) {
+func newFrameAEAD(c Cipher, key []byte) (*frameAEAD, error) {
 	a, err := c.newAEAD(key)
 	if err != nil {
 		return nil, err

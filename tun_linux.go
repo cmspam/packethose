@@ -1,7 +1,10 @@
-package main
+//go:build linux
+
+package packethose
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"unsafe"
 
@@ -14,6 +17,8 @@ const (
 	iffNoPI       = 0x1000
 	iffMultiQueue = 0x0100
 	iffVnetHdr    = 0x4000
+
+	virtioNetHdrLen = 10
 )
 
 type ifreq struct {
@@ -22,15 +27,59 @@ type ifreq struct {
 	_     [22]byte
 }
 
-func openTunQueue(name string, multiQueue bool) (int, string, error) {
-	return openTunQueueOpts(name, multiQueue, false)
+// kernelTUN is a Linux /dev/net/tun queue. It is one PacketIO per queue;
+// open multiple via OpenKernelTUN to feed multi-lane setups.
+type kernelTUN struct {
+	fd      int
+	vnetHdr bool
 }
 
-// openTunQueueOpts opens a TUN queue, optionally with IFF_VNET_HDR. When vnetHdr
-// is true the kernel will prepend a virtio_net_hdr to every TUN read and expect
-// the same prefix on every TUN write, enabling GRO on reads (super-packets) and
-// GSO on writes (auto-segmentation).
-func openTunQueueOpts(name string, multiQueue, vnetHdr bool) (int, string, error) {
+func (k *kernelTUN) Read(p []byte) (int, error) {
+	for {
+		n, err := unix.Read(k.fd, p)
+		if errors.Is(err, unix.EINTR) {
+			continue
+		}
+		return n, err
+	}
+}
+
+func (k *kernelTUN) Write(p []byte) (int, error)  { return unix.Write(k.fd, p) }
+func (k *kernelTUN) Close() error                 { return unix.Close(k.fd) }
+func (k *kernelTUN) VnetHdr() bool                { return k.vnetHdr }
+
+// OpenKernelTUN opens `queues` queues on the named multi-queue TUN device.
+// If the device does not exist, the kernel creates it. The returned slice has
+// exactly `queues` PacketIO entries; one per lane.
+//
+// vnetHdr enables IFF_VNET_HDR (size 10), TUNSETOFFLOAD with CSUM+TSO4+TSO6,
+// and produces super-packets via kernel GRO that ride the lane verbatim.
+//
+// Returns the negotiated interface name (which may differ from `name` if the
+// kernel renumbered it) and the queue PacketIOs.
+func OpenKernelTUN(name string, queues int, vnetHdr bool) ([]PacketIO, string, error) {
+	if queues < 1 {
+		return nil, "", fmt.Errorf("queues must be >= 1")
+	}
+	out := make([]PacketIO, 0, queues)
+	var ifname string
+	for i := 0; i < queues; i++ {
+		fd, nm, err := openTunQueue(name, queues > 1, vnetHdr)
+		if err != nil {
+			for _, p := range out {
+				_ = p.Close()
+			}
+			return nil, "", fmt.Errorf("open queue %d: %w", i, err)
+		}
+		if ifname == "" {
+			ifname = nm
+		}
+		out = append(out, &kernelTUN{fd: fd, vnetHdr: vnetHdr})
+	}
+	return out, ifname, nil
+}
+
+func openTunQueue(name string, multiQueue, vnetHdr bool) (int, string, error) {
 	fd, err := unix.Open("/dev/net/tun", unix.O_RDWR|unix.O_CLOEXEC, 0)
 	if err != nil {
 		return -1, "", fmt.Errorf("open /dev/net/tun: %w", err)
@@ -50,21 +99,14 @@ func openTunQueueOpts(name string, multiQueue, vnetHdr bool) (int, string, error
 		return -1, "", fmt.Errorf("TUNSETIFF: %w", errno)
 	}
 	if vnetHdr {
-		// Pin the header size to 10 (the legacy virtio_net_hdr layout). The
-		// kernel default is already 10, but be explicit so we never desync
-		// with a kernel that ships a different default.
 		sz := uint32(virtioNetHdrLen)
 		_, _, errno := unix.Syscall(unix.SYS_IOCTL, uintptr(fd), uintptr(unix.TUNSETVNETHDRSZ), uintptr(unsafe.Pointer(&sz)))
 		if errno != 0 {
 			unix.Close(fd)
 			return -1, "", fmt.Errorf("TUNSETVNETHDRSZ: %w", errno)
 		}
-		// Ask the kernel to coalesce TCP segments on TUN reads (GRO) and to
-		// segment large TCP super-packets we write back (GSO). We enable v4
-		// and v6 TCP segmentation plus checksum offload. Without this the
-		// IFF_VNET_HDR flag is still honored but the kernel will only ever
-		// return single packets - the GRO coalescing path needs the offload
-		// hint to engage.
+		// Enable TCP segmentation + checksum offload so the kernel coalesces
+		// inbound segments (GRO) and re-segments outbound super-packets (GSO).
 		off := uint32(unix.TUN_F_CSUM | unix.TUN_F_TSO4 | unix.TUN_F_TSO6)
 		_, _, errno = unix.Syscall(unix.SYS_IOCTL, uintptr(fd), uintptr(unix.TUNSETOFFLOAD), uintptr(off))
 		if errno != 0 {

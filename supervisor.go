@@ -1,4 +1,4 @@
-package main
+package packethose
 
 import (
 	"context"
@@ -18,14 +18,14 @@ const (
 // or a transient error occurs (the supervisor will retry with backoff).
 type connSource func(ctx context.Context) (net.Conn, laneKeys, error)
 
-// runSupervised owns one TUN queue and drives outer connections under it,
+// runSupervised owns one PacketIO and drives outer connections under it,
 // acquiring -> running I/O -> reacquiring on any failure, with exponential
-// backoff and jitter. The TUN fd stays open for the supervisor's lifetime;
+// backoff and jitter. The PacketIO stays open for the supervisor's lifetime;
 // outer connections come and go beneath it.
 //
 // Cancel ctx to shut the supervisor down. The active outer connection is
-// closed, in-flight I/O unblocks via the conn close, and the loop returns.
-func runSupervised(ctx context.Context, id, tunFd int, src connSource, cf *commonFlags) {
+// closed, in-flight I/O unblocks, and the loop returns.
+func runSupervised(ctx context.Context, id int, pio PacketIO, src connSource, extraTune func(net.Conn), logger *log.Logger) {
 	backoff := backoffInitial
 	for {
 		if ctx.Err() != nil {
@@ -36,7 +36,7 @@ func runSupervised(ctx context.Context, id, tunFd int, src connSource, cf *commo
 			if ctx.Err() != nil {
 				return
 			}
-			log.Printf("lane %d: acquire: %v (retry in ~%s)", id, err, backoff)
+			logger.Printf("lane %d: acquire: %v (retry in ~%s)", id, err, backoff)
 			if !sleepJitter(ctx, backoff) {
 				return
 			}
@@ -44,7 +44,7 @@ func runSupervised(ctx context.Context, id, tunFd int, src connSource, cf *commo
 			continue
 		}
 		backoff = backoffInitial
-		log.Printf("lane %d: up peer=%s cipher=%s", id, c.RemoteAddr(), keys.kind)
+		logger.Printf("lane %d: up peer=%s cipher=%s", id, c.RemoteAddr(), keys.kind)
 
 		// Unblock I/O on shutdown by closing the conn.
 		ioDone := make(chan struct{})
@@ -56,13 +56,9 @@ func runSupervised(ctx context.Context, id, tunFd int, src connSource, cf *commo
 			}
 		}()
 
-		if cf.vnetHdr {
-			runLaneVnetHdr(id, tunFd, c, keys)
-		} else {
-			runLane(id, tunFd, c, keys)
-		}
+		runLane(pio, c, keys, extraTune, logger)
 		close(ioDone)
-		log.Printf("lane %d: down", id)
+		logger.Printf("lane %d: down", id)
 	}
 }
 
@@ -88,9 +84,9 @@ func sleepJitter(ctx context.Context, d time.Duration) bool {
 	}
 }
 
-// ---- client-side source ----
-
-func clientSource(peer string, psk []byte, cipher cipherKind, dialer *net.Dialer) connSource {
+// clientSource returns a connSource that dials peer over dialer and runs the
+// initiate-side handshake.
+func clientSource(peer string, psk []byte, cipher Cipher, dialer ContextDialer) connSource {
 	return func(ctx context.Context) (net.Conn, laneKeys, error) {
 		c, err := dialer.DialContext(ctx, "tcp", peer)
 		if err != nil {
@@ -105,18 +101,16 @@ func clientSource(peer string, psk []byte, cipher cipherKind, dialer *net.Dialer
 	}
 }
 
-// ---- server-side source ----
+// serverPool is a small queue of accepted+handshaked connections waiting to be
+// claimed by lane supervisors. Lanes are symmetric so any incoming connection
+// can fill any waiting lane slot.
+type serverPool struct {
+	ready chan acceptedConn
+}
 
 type acceptedConn struct {
 	c    net.Conn
 	keys laneKeys
-}
-
-// serverPool is a small queue of accepted+handshaked connections waiting to be
-// claimed by lane supervisors. The accept loop pushes; supervisors pop. Any
-// lane will accept any incoming connection — they are symmetric.
-type serverPool struct {
-	ready chan acceptedConn
 }
 
 func newServerPool(cap int) *serverPool {
@@ -134,16 +128,14 @@ func (p *serverPool) source() connSource {
 	}
 }
 
-// runAcceptLoop accepts on ln, validates source IP and handshake, and pushes
-// onto the pool. It runs until ctx is done or the listener errors permanently.
-func runAcceptLoop(ctx context.Context, ln net.Listener, allow string, psk []byte, pool *serverPool) {
+func runAcceptLoop(ctx context.Context, ln net.Listener, allow string, psk []byte, pool *serverPool, logger *log.Logger) {
 	for {
 		c, err := ln.Accept()
 		if err != nil {
 			if ctx.Err() != nil {
 				return
 			}
-			log.Printf("accept: %v", err)
+			logger.Printf("accept: %v", err)
 			if !sleepJitter(ctx, 500*time.Millisecond) {
 				return
 			}
@@ -151,14 +143,14 @@ func runAcceptLoop(ctx context.Context, ln net.Listener, allow string, psk []byt
 		}
 		if allow != "" {
 			if ip := remoteIP(c); ip != allow {
-				log.Printf("reject %s (allow=%s)", ip, allow)
+				logger.Printf("reject %s (allow=%s)", ip, allow)
 				c.Close()
 				continue
 			}
 		}
 		keys, err := acceptHandshake(c, psk)
 		if err != nil {
-			log.Printf("handshake fail from %s: %v", c.RemoteAddr(), err)
+			logger.Printf("handshake fail from %s: %v", c.RemoteAddr(), err)
 			c.Close()
 			continue
 		}
@@ -169,4 +161,12 @@ func runAcceptLoop(ctx context.Context, ln net.Listener, allow string, psk []byt
 			return
 		}
 	}
+}
+
+func remoteIP(c net.Conn) string {
+	host, _, err := net.SplitHostPort(c.RemoteAddr().String())
+	if err != nil {
+		return c.RemoteAddr().String()
+	}
+	return host
 }
