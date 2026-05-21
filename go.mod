@@ -1,4 +1,4 @@
-module packethose
+module github.com/cmspam/packethose
 
 go 1.26
 

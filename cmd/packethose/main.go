@@ -11,7 +11,7 @@ import (
 	"os/signal"
 	"syscall"
 
-	"packethose"
+	"github.com/cmspam/packethose"
 )
 
 func main() {
