@@ -133,7 +133,7 @@ func runServer(args []string) {
 	fs.StringVar(&serverIP, "server-ip", "", "multi-client tunnel-side IPv4 server IP (required with --subnet)")
 	fs.StringVar(&subnet6, "subnet6", "", "multi-client IPv6 subnet (CIDR, e.g. fd00:66::/64); requires --psk")
 	fs.StringVar(&serverIP6, "server-ip6", "", "multi-client tunnel-side IPv6 server IP (required with --subnet6)")
-	fs.StringVar(&tunPrefix, "tun-prefix", "", "device-name prefix for per-client TUNs in multi-client mode (default phose)")
+	fs.StringVar(&tunPrefix, "tun-name", "", "name of the shared TUN device in multi-client mode (default phose0)")
 	fs.StringVar(&configPath, "config", "", "path to YAML config (overlays beneath CLI flags)")
 	fs.Parse(args)
 
@@ -181,7 +181,7 @@ func runServer(args []string) {
 		multiClient = true
 	}
 	if tunPrefix != "" {
-		cfg.TUNPrefix = tunPrefix
+		cfg.TUNName = tunPrefix
 	}
 
 	fileCfg, err := packethose.LoadFile(configPath)
@@ -197,8 +197,8 @@ func runServer(args []string) {
 	if cfg.Subnet.IsValid() || cfg.Subnet6.IsValid() {
 		multiClient = true
 	}
-	if cfg.TUNPrefix == "" {
-		cfg.TUNPrefix = "phose"
+	if cfg.TUNName == "" {
+		cfg.TUNName = "phose0"
 	}
 
 	// Phase A wires BBR per accepted socket. brutal_mbps still

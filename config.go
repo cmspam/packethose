@@ -159,13 +159,18 @@ type ServerConfig struct {
 	// when Subnet/Subnet6 is set.
 	ServerIP  netip.Addr
 	ServerIP6 netip.Addr
-	// TUNPrefix is the device-name prefix for per-client TUNs in
-	// multi-client mode (default "phose"). Each client gets
-	// <prefix>-<short-id>.
-	TUNPrefix string
-	// VnetHdr enables IFF_VNET_HDR on the per-client TUN devices in
-	// multi-client mode.
+	// TUNName is the name of the single shared TUN device the
+	// multi-client server opens for all sessions (default "phose0").
+	// One device, multi-queue, with the pool /N and /M assigned
+	// directly to it; per-client routing is by IP in userspace.
+	TUNName string
+	// VnetHdr enables IFF_VNET_HDR on the shared TUN device.
 	VnetHdr bool
+	// SharedTUNQueues controls how many multi-queue file descriptors
+	// the shared TUN is opened with. Defaults to runtime.NumCPU(). Each
+	// queue gets its own reader goroutine that dispatches by inner dst
+	// IP to per-session channels.
+	SharedTUNQueues int
 
 	// NFT, when Enabled is true, installs a dedicated nftables table
 	// at startup (and removes it at shutdown) with forwarding,

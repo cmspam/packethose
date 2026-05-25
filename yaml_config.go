@@ -24,7 +24,7 @@ type FileConfig struct {
 	BBR       *bool          `yaml:"bbr"`
 	VnetHdr   *bool          `yaml:"vnet_hdr"`
 	AllowIP   string         `yaml:"allow_ip"`
-	TUNPrefix string         `yaml:"tun_prefix"`
+	TUNName   string         `yaml:"tun_name"`
 	ServerPSK string         `yaml:"server_psk"`
 	Brutal    BrutalConfig   `yaml:"brutal"`
 	Pool      PoolConfig     `yaml:"pool"`
@@ -159,8 +159,8 @@ func (fc FileConfig) ApplyServer(cfg *ServerConfig) error {
 	if cfg.AllowIP == "" && fc.AllowIP != "" {
 		cfg.AllowIP = fc.AllowIP
 	}
-	if cfg.TUNPrefix == "" && fc.TUNPrefix != "" {
-		cfg.TUNPrefix = fc.TUNPrefix
+	if cfg.TUNName == "" && fc.TUNName != "" {
+		cfg.TUNName = fc.TUNName
 	}
 	if fc.VnetHdr != nil {
 		cfg.VnetHdr = *fc.VnetHdr
