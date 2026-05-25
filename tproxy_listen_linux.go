@@ -397,6 +397,14 @@ func (t *TPROXYListener) openUDPFlow(ctx context.Context, src, dst netip.AddrPor
 // Client packets arrive on flow.queue and go out via flow.upstream;
 // upstream replies come back on flow.upstream and go to the client
 // via flow.reply (which spoofs the destination address).
+//
+// Both directions close the shared f.done channel on exit so the
+// other direction unblocks immediately. The deferred cleanup closes
+// both sockets and removes the flow from the map. Without this
+// cross-signal, a stalled upstream (inner returns on read timeout)
+// would leave the outer loop waiting on its own idle timer, holding
+// the IP_TRANSPARENT reply socket bound to dst:port for up to
+// UDPIdleTimeout after the flow effectively ended.
 func (t *TPROXYListener) runUDPFlow(ctx context.Context, f *tproxyUDPFlow, mu *sync.Mutex, flows map[string]*tproxyUDPFlow, key string) {
 	defer t.wg.Done()
 	defer func() {
@@ -413,10 +421,13 @@ func (t *TPROXYListener) runUDPFlow(ctx context.Context, f *tproxyUDPFlow, mu *s
 
 	// upstream-to-client goroutine: read from the per-flow upstream
 	// socket and write back through the IP_TRANSPARENT reply socket
-	// so the client sees the original destination as source.
+	// so the client sees the original destination as source. On any
+	// exit, close f.done so the outer client-to-upstream loop wakes
+	// up and the deferred socket cleanup runs.
 	t.wg.Add(1)
 	go func() {
 		defer t.wg.Done()
+		defer f.closeOne.Do(func() { close(f.done) })
 		buf := make([]byte, 65535)
 		for {
 			select {
@@ -439,6 +450,8 @@ func (t *TPROXYListener) runUDPFlow(ctx context.Context, f *tproxyUDPFlow, mu *s
 	}()
 
 	// client-to-upstream loop: pull from queue, write to upstream.
+	idle := time.NewTimer(t.cfg.UDPIdleTimeout)
+	defer idle.Stop()
 	for {
 		select {
 		case <-ctx.Done():
@@ -451,7 +464,14 @@ func (t *TPROXYListener) runUDPFlow(ctx context.Context, f *tproxyUDPFlow, mu *s
 			if _, err := f.upstream.WriteTo(data, dstAddr); err != nil {
 				return
 			}
-		case <-time.After(t.cfg.UDPIdleTimeout):
+			if !idle.Stop() {
+				select {
+				case <-idle.C:
+				default:
+				}
+			}
+			idle.Reset(t.cfg.UDPIdleTimeout)
+		case <-idle.C:
 			return
 		}
 	}
