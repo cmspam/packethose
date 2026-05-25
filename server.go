@@ -58,6 +58,42 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 
 // Run blocks until ctx is canceled or the listener errors fatally.
 func (s *Server) Run(ctx context.Context) error {
+	// Bring up the auto-installed nftables before we accept any
+	// connections so the first packet a client sends is already
+	// covered by the forwarding posture. Reconcile tolerates a stale
+	// table from a previous ungraceful exit.
+	var nftInstaller *NFTInstaller
+	if s.cfg.NFT.Enabled {
+		ni, err := NewNFTInstaller(s.cfg.NFT, s.logger)
+		if err != nil {
+			return fmt.Errorf("packethose server: nft installer: %w", err)
+		}
+		if err := ni.Reconcile(); err != nil {
+			return fmt.Errorf("packethose server: nft reconcile: %w", err)
+		}
+		nftInstaller = ni
+		defer func() {
+			if err := nftInstaller.Remove(); err != nil {
+				s.logger.Printf("nft: remove on shutdown: %v", err)
+			}
+		}()
+	}
+
+	// TPROXY termination listener: runs alongside the tunnel server
+	// so traffic redirected by the prerouting hook lands here.
+	var tproxyListener *TPROXYListener
+	if s.cfg.TPROXY.Enabled {
+		tl, err := NewTPROXYListener(s.cfg.TPROXY, s.logger)
+		if err != nil {
+			return fmt.Errorf("packethose server: tproxy listener: %w", err)
+		}
+		if err := tl.Start(ctx); err != nil {
+			return fmt.Errorf("packethose server: tproxy start: %w", err)
+		}
+		tproxyListener = tl
+		defer tproxyListener.Stop()
+	}
+
 	lc := s.cfg.ListenConfig
 	if lc == nil {
 		lc = &net.ListenConfig{}

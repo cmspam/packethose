@@ -259,7 +259,48 @@ forward:
   tproxy_listen_port: 13338
   tproxy_fwmark: 0x1
   tproxy_table: 13338
+  tun_match: "phose-*"
+  egress_interface: ""    # empty: any non-phose-* output
 ```
+
+### Forward posture
+
+When the YAML `forward:` block requests any of isolation, masquerade,
+or tproxy, the server installs a dedicated nftables table at startup
+and removes it on shutdown:
+
+```
+table inet packethose {
+  chain prerouting {              # when forward.tproxy
+    iifname "phose-*" tproxy to :13338 meta mark set 0x1 accept
+  }
+  chain forward {                 # when forward.isolation
+    iifname "phose-*" oifname "phose-*" drop
+  }
+  chain postrouting {              # when forward.masquerade
+    iifname "phose-*" oifname != "phose-*" masquerade
+  }
+}
+```
+
+With `forward.tproxy: true`, the server also installs the matching
+`ip rule add fwmark 0x1 lookup 13338` and `ip route add local default
+dev lo table 13338` (v4 and v6 as configured) and runs the TPROXY
+termination listener on port 13338. The listener accepts redirected
+TCP and UDP flows, dials the original destination directly, and pairs
+the sockets with `io.Copy` so Go's runtime drops into `splice()` for
+TCP byte movement. UDP runs a per-flow demux with an IP_TRANSPARENT
+reply socket so the client sees responses from the original
+destination.
+
+Inter-client isolation is enforced in two places: the nftables
+forward chain (for ICMP and non-TPROXY'd traffic) and the TPROXY
+listener's accept handler (TPROXY traffic bypasses the forward
+chain). Both gates check the destination against the pool subnets.
+
+Removing the YAML `forward:` block, or setting all of isolation,
+masquerade, and tproxy to false, leaves packethose in pure-tunnel
+mode: no nftables, no TPROXY listener, no policy routing.
 
 ### Per-user identity
 

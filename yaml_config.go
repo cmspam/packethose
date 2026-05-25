@@ -6,6 +6,7 @@ import (
 	"net/netip"
 	"os"
 	"strings"
+	"time"
 
 	"gopkg.in/yaml.v3"
 )
@@ -205,6 +206,64 @@ func (fc FileConfig) ApplyServer(cfg *ServerConfig) error {
 	}
 	if len(users) > 0 {
 		cfg.Users = users
+	}
+	if err := fc.applyForward(cfg); err != nil {
+		return err
+	}
+	return nil
+}
+
+// applyForward translates the YAML forward / nft / tproxy blocks
+// into the runtime NFTConfig and TPROXYConfig on ServerConfig.
+func (fc FileConfig) applyForward(cfg *ServerConfig) error {
+	fwd := fc.Forward
+
+	// nft installer mirrors the forward posture. Default Enabled is
+	// driven by whether any forward feature is requested; the
+	// optional NFTFileConfig.Enabled override wins when set.
+	nftWanted := fwd.Isolation || fwd.Masquerade || fwd.TPROXY
+	enabled := nftWanted
+	if fc.NFT.Enabled != nil {
+		enabled = *fc.NFT.Enabled
+	}
+	cfg.NFT = NFTConfig{
+		Enabled:         enabled,
+		Family:          fc.NFT.Family,
+		TableName:       fc.NFT.TableName,
+		TUNMatch:        fwd.TUNMatch,
+		Isolation:       fwd.Isolation,
+		Masquerade:      fwd.Masquerade,
+		EgressInterface: fwd.EgressInterface,
+		TPROXY:          fwd.TPROXY,
+		TPROXYPort:      fwd.TPROXYListenPort,
+		TPROXYMark:      fwd.TPROXYFwmark,
+		RouteTable:      fwd.TPROXYTable,
+		IPv4:            cfg.Subnet.IsValid() || (!cfg.Subnet.IsValid() && !cfg.Subnet6.IsValid()),
+		IPv6:            cfg.Subnet6.IsValid(),
+	}
+
+	// TPROXY listener: enabled by default when forward.tproxy is on.
+	tproxyEnabled := fwd.TPROXY
+	if fc.TPROXY.Enabled != nil {
+		tproxyEnabled = *fc.TPROXY.Enabled
+	}
+	cfg.TPROXY = TPROXYConfig{
+		Enabled:    tproxyEnabled,
+		ListenAddr: fc.TPROXY.ListenAddr,
+		ListenPort: fwd.TPROXYListenPort,
+		PoolV4:     cfg.Subnet,
+		PoolV6:     cfg.Subnet6,
+	}
+	if fc.TPROXY.ListenPort != 0 {
+		cfg.TPROXY.ListenPort = fc.TPROXY.ListenPort
+	}
+	if fc.TPROXY.UDPIdleSecs > 0 {
+		cfg.TPROXY.UDPIdleTimeout = time.Duration(fc.TPROXY.UDPIdleSecs) * time.Second
+	}
+	if fc.TPROXY.EnforceIso != nil {
+		cfg.TPROXY.EnforceIsolation = *fc.TPROXY.EnforceIso
+	} else {
+		cfg.TPROXY.EnforceIsolation = fwd.Isolation
 	}
 	return nil
 }

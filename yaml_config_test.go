@@ -71,4 +71,69 @@ forward:
 	if len(cfg.Users) != 2 {
 		t.Fatalf("Users not set: %d", len(cfg.Users))
 	}
+	if !cfg.NFT.Enabled || !cfg.NFT.Isolation || !cfg.NFT.Masquerade {
+		t.Fatalf("NFT not populated: %#v", cfg.NFT)
+	}
+	if cfg.NFT.TPROXY {
+		t.Fatalf("forward.tproxy was false but NFT.TPROXY is true")
+	}
+	if cfg.TPROXY.Enabled {
+		t.Fatalf("forward.tproxy was false but TPROXY.Enabled is true")
+	}
+}
+
+func TestApplyForwardTPROXYEnabled(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "server.yaml")
+	body := `
+listen: 0.0.0.0:4500
+pool:
+  v4_subnet: 10.66.0.0/24
+  server_ip4: 10.66.0.1
+users:
+  - name: alice
+    psk_hex: "0102030405060708090a0b0c0d0e0f10"
+forward:
+  isolation: true
+  masquerade: true
+  tproxy: true
+  tproxy_listen_port: 13338
+  tproxy_fwmark: 1
+  tproxy_table: 13338
+  tun_match: "phose-*"
+tproxy:
+  udp_idle_secs: 30
+`
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	fc, err := LoadFile(path)
+	if err != nil {
+		t.Fatalf("LoadFile: %v", err)
+	}
+	var cfg ServerConfig
+	if err := fc.ApplyServer(&cfg); err != nil {
+		t.Fatalf("ApplyServer: %v", err)
+	}
+	if !cfg.NFT.Enabled || !cfg.NFT.TPROXY || !cfg.NFT.Isolation || !cfg.NFT.Masquerade {
+		t.Fatalf("nft not fully populated: %#v", cfg.NFT)
+	}
+	if cfg.NFT.TPROXYPort != 13338 || cfg.NFT.TPROXYMark != 1 || cfg.NFT.RouteTable != 13338 {
+		t.Fatalf("nft tproxy params: %#v", cfg.NFT)
+	}
+	if cfg.NFT.TUNMatch != "phose-*" {
+		t.Fatalf("tun_match: %q", cfg.NFT.TUNMatch)
+	}
+	if !cfg.TPROXY.Enabled || cfg.TPROXY.ListenPort != 13338 {
+		t.Fatalf("tproxy listener not enabled or wrong port: %#v", cfg.TPROXY)
+	}
+	if !cfg.TPROXY.EnforceIsolation {
+		t.Fatalf("tproxy isolation default should follow forward.isolation")
+	}
+	if cfg.TPROXY.UDPIdleTimeout.Seconds() != 30 {
+		t.Fatalf("udp idle: %v", cfg.TPROXY.UDPIdleTimeout)
+	}
+	if !cfg.TPROXY.PoolV4.IsValid() || cfg.TPROXY.PoolV4.String() != "10.66.0.0/24" {
+		t.Fatalf("pool v4 not threaded into tproxy: %v", cfg.TPROXY.PoolV4)
+	}
 }

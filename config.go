@@ -7,6 +7,7 @@ import (
 	"log"
 	"net"
 	"net/netip"
+	"time"
 )
 
 // Cipher selects the AEAD used for per-frame payload protection.
@@ -165,6 +166,50 @@ type ServerConfig struct {
 	// VnetHdr enables IFF_VNET_HDR on the per-client TUN devices in
 	// multi-client mode.
 	VnetHdr bool
+
+	// NFT, when Enabled is true, installs a dedicated nftables table
+	// at startup (and removes it at shutdown) with forwarding,
+	// isolation, masquerade, and TPROXY rules per the config. See
+	// NFTInstaller.
+	NFT NFTConfig
+
+	// TPROXY, when Enabled is true, runs a TPROXY listener that
+	// terminates client TCP and UDP flows in kernel space and dials
+	// the original destination directly. Pair with NFT.TPROXY = true
+	// so the kernel actually redirects matching traffic to this
+	// listener.
+	TPROXY TPROXYConfig
+}
+
+// TPROXYConfig configures the packethose TPROXY termination listener.
+// Pair with an NFT installer that redirects matching traffic to
+// ListenPort, and an IP rule that lifts marked packets into the same
+// routing table as the listener binds inside.
+type TPROXYConfig struct {
+	Enabled bool
+
+	// ListenAddr is the loopback bind address. Empty defaults to
+	// "127.0.0.1" (v4) plus "[::1]" (v6); the listener opens one
+	// dual-stack socket on ListenPort.
+	ListenAddr string
+
+	// ListenPort is the TPROXY listener port. Default 13338.
+	ListenPort int
+
+	// UDPIdleTimeout is the per-flow idle timeout for UDP. Default
+	// 60s.
+	UDPIdleTimeout time.Duration
+
+	// EnforceIsolation rejects dials whose destination falls inside
+	// the configured pool subnets. Set true when isolation is on; the
+	// nftables forward chain does not see TPROXY'd traffic.
+	EnforceIsolation bool
+
+	// PoolV4 / PoolV6 are the pool subnets used by the isolation
+	// check. The Server populates them from cfg.Subnet / cfg.Subnet6
+	// at startup so the listener does not need a back-reference.
+	PoolV4 netip.Prefix
+	PoolV6 netip.Prefix
 }
 
 // Validate returns nil if the config is internally consistent.
