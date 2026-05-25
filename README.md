@@ -218,6 +218,68 @@ IPv6 is supported on three independent layers, each opt-in:
 | `--request-ip6` (client) | (empty) | Preferred IPv6 from a multi-client server's pool. |
 | `--auto-ip` (client) | off | Apply the server-assigned address(es) to the local TUN automatically. |
 
+## YAML config
+
+CLI flags continue to work. A YAML file is a shipping shape that
+keeps a long argv off the systemd unit and lets you describe a
+multi-user server in one place. Load with `--config /path/file.yaml`.
+CLI flags that are set on the command line override any value the
+YAML provides.
+
+```yaml
+listen: 0.0.0.0:4500
+lanes: 4
+mptcp: false
+cipher: aes-gcm
+bbr: true
+
+brutal:
+  enabled: false
+  rate_mbps: 0
+
+pool:
+  v4_subnet: 10.66.0.0/24
+  v6_subnet: fd00:66::/64
+  server_ip4: 10.66.0.1
+  server_ip6: fd00:66::1
+
+users:
+  - name: alice
+    psk_hex: "deadbeef..."
+    max_concurrent: 3
+  - name: bob
+    psk_hex: "cafef00d..."
+    max_concurrent: 2
+    reserved: [10.66.0.5, fd00:66::5]
+
+forward:
+  isolation: true
+  masquerade: true
+  tproxy: true
+  tproxy_listen_port: 13338
+  tproxy_fwmark: 0x1
+  tproxy_table: 13338
+```
+
+### Per-user identity
+
+A configured `users[]` block switches the server into multi-user
+mode. Each user has its own PSK and an optional `max_concurrent`
+quota. Reserved addresses are tied to one user; the pool refuses to
+hand them to anybody else. The client sends its `--user NAME` in the
+handshake and the server selects the matching PSK in O(1).
+
+The legacy single-PSK server is still available: omit `users[]` and
+set `server_psk` (or pass `--psk` on the command line).
+
+### BBR
+
+When `bbr: true` (the default), the server sets TCP_CONGESTION="bbr"
+on every accepted and dialed outer socket. Kernels that do not list
+bbr in `/proc/sys/net/ipv4/tcp_allowed_congestion_control` keep
+whatever default they have; the option is best-effort and never
+fails the connection.
+
 ## Wire protocol
 
 ### Default mode
@@ -242,19 +304,22 @@ Length is the ciphertext plus the 16-byte tag. The nonce is a
 per-lane per-direction 64-bit counter. TCP keeps the endpoints in
 lockstep so the counter does not appear on the wire.
 
-### Handshake (when `--psk` is set, wire version 4)
+### Handshake (when `--psk` is set, wire version 5)
 Each address slot on the wire is 17 bytes: a 1-byte family tag (0,
 4, or 6) followed by a 16-byte payload (IPv4 uses the first 4 bytes
-and zero-pads the rest).
+and zero-pads the rest). The 16-byte `user_name` field is NUL-padded
+text; an all-zero field selects the legacy single-PSK fallback when
+the server has no `users[]` block.
 ```
-client -> magic "PHOS"(4) || ver(1)=4 || cipher(1) || nonce_c(32)
-       || client_id(16) || lane_count(1) || req_v4(17) || req_v6(17)
+client -> magic "PHOS"(4) || ver(1)=5 || cipher(1) || user_name(16)
+       || nonce_c(32) || client_id(16) || lane_count(1)
+       || req_v4(17) || req_v6(17)
 server -> magic || ver || cipher
-       || HMAC(psk, ver||cipher||nonce_c||client_id||lane_count||req_v4||req_v6)(32)
+       || HMAC(psk, ver||cipher||user_name||nonce_c||client_id||lane_count||req_v4||req_v6)(32)
        || nonce_s(32)
        || asg_v4(17) || prefix_v4(1) || peer_v4(17)
        || asg_v6(17) || prefix_v6(1) || peer_v6(17)
-client -> HMAC(psk, ver||cipher||nonce_s||asg_v4||prefix_v4||peer_v4||asg_v6||prefix_v6||peer_v6)(32)
+client -> HMAC(psk, ver||cipher||user_name||nonce_s||asg_v4||prefix_v4||peer_v4||asg_v6||prefix_v6||peer_v6)(32)
 ```
 Per-direction session keys are derived via HKDF-SHA256 over `(psk,
 nonce_c || nonce_s)`. A family's `prefix` is zero when the server

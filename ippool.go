@@ -65,18 +65,64 @@ func newIPPool(subnet netip.Prefix, reserved ...netip.Addr) (*ipPool, error) {
 // Allocate returns (newly-allocated or sticky) host address for clientID.
 // If preferred is non-zero, in-subnet, and free, it is honored.
 func (p *ipPool) Allocate(clientID [clientIDLen]byte, preferred netip.Addr) (netip.Addr, error) {
+	return p.AllocateFor("", clientID, preferred, nil)
+}
+
+// AllocateFor is the multi-user variant of Allocate. It honors the
+// caller's reservation list before the general pool and lets the
+// supplied UserDB veto addresses that are reserved by other users.
+//
+// Allocation order:
+//  1. Sticky map: same clientID already has an IP, return it.
+//  2. Preferred IP: granted when it is in subnet, owned by this user
+//     (or unreserved), and free.
+//  3. User's own free reservations.
+//  4. Pool walk that skips every reservation regardless of owner.
+func (p *ipPool) AllocateFor(userName string, clientID [clientIDLen]byte, preferred netip.Addr, db *UserDB) (netip.Addr, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+
+	familyMatch := func(a netip.Addr) bool {
+		if !a.IsValid() {
+			return false
+		}
+		if p.isV4 {
+			return a.Is4()
+		}
+		return a.Is6()
+	}
 
 	if cur, ok := p.byClient[clientID]; ok {
 		return cur, nil
 	}
 
-	if preferred.IsValid() && !preferred.IsUnspecified() && p.subnet.Contains(preferred) &&
-		!p.reserved[preferred] && !p.used[preferred] {
-		p.used[preferred] = true
-		p.byClient[clientID] = preferred
-		return preferred, nil
+	otherUserReserved := func(a netip.Addr) bool {
+		if db == nil {
+			return false
+		}
+		owner := db.ReservationOwner(a)
+		return owner != "" && owner != userName
+	}
+
+	if preferred.IsValid() && !preferred.IsUnspecified() && familyMatch(preferred) &&
+		p.subnet.Contains(preferred) && !p.used[preferred] && !otherUserReserved(preferred) {
+		// p.reserved contains every reservation; allow when this user owns it.
+		if !p.reserved[preferred] || (db != nil && db.ReservationOwner(preferred) == userName) {
+			p.used[preferred] = true
+			p.byClient[clientID] = preferred
+			return preferred, nil
+		}
+	}
+
+	if db != nil && userName != "" {
+		for _, r := range db.ReservedFor(userName) {
+			if !familyMatch(r) || !p.subnet.Contains(r) || p.used[r] {
+				continue
+			}
+			p.used[r] = true
+			p.byClient[clientID] = r
+			return r, nil
+		}
 	}
 
 	if p.isV4 {
@@ -91,7 +137,6 @@ func (p *ipPool) Allocate(clientID [clientIDLen]byte, preferred netip.Addr) (net
 		return netip.Addr{}, errors.New("ipPool: exhausted")
 	}
 
-	// IPv6: hash-derived. Try a few hash rotations on collision.
 	for round := byte(0); round < 8; round++ {
 		candidate := v6FromClientID(p.subnet, clientID, round)
 		if p.reserved[candidate] || p.used[candidate] {

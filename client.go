@@ -64,7 +64,7 @@ func (cl *Client) Run(ctx context.Context) error {
 		req.V6 = cl.cfg.RequestIP6
 	}
 
-	src := clientSource(cl.cfg.Peer, cl.cfg.PSK, cl.cfg.Cipher, dialer, cl.clientID, byte(cl.cfg.Lanes), req)
+	src := clientSource(cl.cfg.Peer, cl.cfg.PSK, cl.cfg.Cipher, dialer, cl.cfg.UserName, cl.clientID, byte(cl.cfg.Lanes), req)
 
 	var assignOnce sync.Once
 	onAssign := func(a Assignment) {

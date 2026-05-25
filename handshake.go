@@ -15,7 +15,7 @@ import (
 
 const (
 	hsMagic   uint32 = 0x50484F53 // "PHOS"
-	hsVersion byte   = 4          // v4: dual-stack address fields (v4 + v6)
+	hsVersion byte   = 5          // v5 adds a 16-byte username field for per-user identity
 	hsTimeout        = 5 * time.Second
 	nonceLen         = 32
 	macLen           = 32
@@ -32,6 +32,7 @@ type laneIdentity struct {
 	keys      laneKeys
 	clientID  [clientIDLen]byte
 	laneCount byte
+	userName  string
 
 	assigned4 netip.Addr
 	prefix4   byte
@@ -103,29 +104,30 @@ type AssignmentResponse struct {
 // incoming client. Implementations return zero / 0-prefix to decline a family.
 type AssignFunc func(clientID [clientIDLen]byte, req AssignmentRequest) AssignmentResponse
 
-// Wire layout, v4:
+// Wire layout, v5 (v4 plus a leading 16-byte username field so the server
+// can select the matching PSK in O(1)):
 //
 //   client ->
-//     magic(4) || ver(1)=4 || cipher(1) || nonce_c(32)
+//     magic(4) || ver(1)=5 || cipher(1) || user_name(16) || nonce_c(32)
 //       || client_id(16) || lane_count(1)
 //       || req_v4(17) || req_v6(17)
 //
 //   server ->
-//     magic(4) || ver(1)=4 || cipher(1)
-//       || HMAC(psk, ver||cipher||nonce_c||client_id||lane_count||req_v4||req_v6)(32)
+//     magic(4) || ver(1)=5 || cipher(1)
+//       || HMAC(psk, ver||cipher||user_name||nonce_c||client_id||lane_count||req_v4||req_v6)(32)
 //       || nonce_s(32)
 //       || asg_v4(17) || prefix_v4(1) || peer_v4(17)
 //       || asg_v6(17) || prefix_v6(1) || peer_v6(17)
 //
 //   client ->
-//     HMAC(psk, ver||cipher||nonce_s||asg_v4||prefix_v4||peer_v4||asg_v6||prefix_v6||peer_v6)(32)
+//     HMAC(psk, ver||cipher||user_name||nonce_s||asg_v4||prefix_v4||peer_v4||asg_v6||prefix_v6||peer_v6)(32)
 
 const (
-	clientMsgLen = 4 + 1 + 1 + nonceLen + clientIDLen + 1 + addrSlotLen + addrSlotLen
+	clientMsgLen = 4 + 1 + 1 + userNameLen + nonceLen + clientIDLen + 1 + addrSlotLen + addrSlotLen
 	serverMsgLen = 4 + 1 + 1 + macLen + nonceLen + addrSlotLen + 1 + addrSlotLen + addrSlotLen + 1 + addrSlotLen
 )
 
-func initiateHandshake(c net.Conn, psk []byte, want Cipher, clientID [clientIDLen]byte, laneCount byte, req AssignmentRequest) (laneIdentity, error) {
+func initiateHandshake(c net.Conn, psk []byte, want Cipher, userName string, clientID [clientIDLen]byte, laneCount byte, req AssignmentRequest) (laneIdentity, error) {
 	if len(psk) == 0 {
 		if want != CipherNone {
 			return laneIdentity{}, fmt.Errorf("encrypt requires PSK")
@@ -140,6 +142,7 @@ func initiateHandshake(c net.Conn, psk []byte, want Cipher, clientID [clientIDLe
 		return laneIdentity{}, err
 	}
 
+	wireName := encodeUserName(userName)
 	reqV4 := encodeAddrSlot(req.V4)
 	reqV6 := encodeAddrSlot(req.V6)
 
@@ -147,8 +150,11 @@ func initiateHandshake(c net.Conn, psk []byte, want Cipher, clientID [clientIDLe
 	binary.BigEndian.PutUint32(msg[0:4], hsMagic)
 	msg[4] = hsVersion
 	msg[5] = byte(want)
-	copy(msg[6:6+nonceLen], nonceC[:])
-	off := 6 + nonceLen
+	off := 6
+	copy(msg[off:off+userNameLen], wireName[:])
+	off += userNameLen
+	copy(msg[off:off+nonceLen], nonceC[:])
+	off += nonceLen
 	copy(msg[off:off+clientIDLen], clientID[:])
 	off += clientIDLen
 	msg[off] = laneCount
@@ -177,6 +183,7 @@ func initiateHandshake(c net.Conn, psk []byte, want Cipher, clientID [clientIDLe
 	}
 	authIn := concat(
 		[]byte{hsVersion, byte(got)},
+		wireName[:],
 		nonceC[:],
 		clientID[:],
 		[]byte{laneCount},
@@ -204,6 +211,7 @@ func initiateHandshake(c net.Conn, psk []byte, want Cipher, clientID [clientIDLe
 
 	cliAuth := concat(
 		[]byte{hsVersion, byte(got)},
+		wireName[:],
 		nonceS,
 		asgV4Bytes, []byte{prefix4}, peerV4Bytes,
 		asgV6Bytes, []byte{prefix6}, peerV6Bytes,
@@ -220,6 +228,7 @@ func initiateHandshake(c net.Conn, psk []byte, want Cipher, clientID [clientIDLe
 		keys:      laneKeys{kind: got, tx: tx, rx: rx},
 		clientID:  clientID,
 		laneCount: laneCount,
+		userName:  userName,
 		assigned4: decodeAddrSlot(asgV4Bytes),
 		prefix4:   prefix4,
 		peer4:     decodeAddrSlot(peerV4Bytes),
@@ -229,10 +238,18 @@ func initiateHandshake(c net.Conn, psk []byte, want Cipher, clientID [clientIDLe
 	}, nil
 }
 
-func acceptHandshake(c net.Conn, psk []byte, assignFn AssignFunc) (laneIdentity, error) {
-	if len(psk) == 0 {
-		return laneIdentity{}, nil
-	}
+// pskResolver returns the PSK to validate a client handshake against.
+// The wire name is the 16-byte field from the client message; the
+// resolver returns the empty user name when the legacy single-PSK
+// fallback path is in use.
+type pskResolver func(wireName [userNameLen]byte) (psk []byte, userName string, err error)
+
+// acceptAssignFunc is the per-handshake hook the server uses to
+// allocate addresses. It receives the identified user name so the
+// pool can apply per-user quota and reservation rules.
+type acceptAssignFunc func(userName string, clientID [clientIDLen]byte, req AssignmentRequest) (AssignmentResponse, error)
+
+func acceptHandshake(c net.Conn, resolve pskResolver, assignFn acceptAssignFunc) (laneIdentity, error) {
 	c.SetDeadline(time.Now().Add(hsTimeout))
 	defer c.SetDeadline(time.Time{})
 
@@ -250,8 +267,12 @@ func acceptHandshake(c net.Conn, psk []byte, assignFn AssignFunc) (laneIdentity,
 	if got != CipherNone && got != CipherAESGCM && got != CipherChaCha {
 		return laneIdentity{}, fmt.Errorf("handshake: unknown cipher %d", got)
 	}
-	nonceC := hdr[6 : 6+nonceLen]
-	pos := 6 + nonceLen
+	pos := 6
+	var wireName [userNameLen]byte
+	copy(wireName[:], hdr[pos:pos+userNameLen])
+	pos += userNameLen
+	nonceC := hdr[pos : pos+nonceLen]
+	pos += nonceLen
 	var clientID [clientIDLen]byte
 	copy(clientID[:], hdr[pos:pos+clientIDLen])
 	pos += clientIDLen
@@ -261,13 +282,24 @@ func acceptHandshake(c net.Conn, psk []byte, assignFn AssignFunc) (laneIdentity,
 	pos += addrSlotLen
 	reqV6Bytes := hdr[pos : pos+addrSlotLen]
 
+	psk, userName, err := resolve(wireName)
+	if err != nil {
+		return laneIdentity{}, err
+	}
+	if len(psk) == 0 {
+		return laneIdentity{}, fmt.Errorf("handshake: no PSK configured")
+	}
+
 	req := AssignmentRequest{
 		V4: decodeAddrSlot(reqV4Bytes),
 		V6: decodeAddrSlot(reqV6Bytes),
 	}
 	var asg AssignmentResponse
 	if assignFn != nil {
-		asg = assignFn(clientID, req)
+		asg, err = assignFn(userName, clientID, req)
+		if err != nil {
+			return laneIdentity{}, err
+		}
 	}
 
 	var nonceS [nonceLen]byte
@@ -286,6 +318,7 @@ func acceptHandshake(c net.Conn, psk []byte, assignFn AssignFunc) (laneIdentity,
 	resp[5] = byte(got)
 	authIn := concat(
 		[]byte{hsVersion, byte(got)},
+		wireName[:],
 		nonceC, clientID[:],
 		[]byte{laneCount},
 		reqV4Bytes, reqV6Bytes,
@@ -316,6 +349,7 @@ func acceptHandshake(c net.Conn, psk []byte, assignFn AssignFunc) (laneIdentity,
 	}
 	cliAuth := concat(
 		[]byte{hsVersion, byte(got)},
+		wireName[:],
 		nonceS[:],
 		asgV4, []byte{asg.V4Prefix}, peerV4,
 		asgV6, []byte{asg.V6Prefix}, peerV6,
@@ -332,6 +366,7 @@ func acceptHandshake(c net.Conn, psk []byte, assignFn AssignFunc) (laneIdentity,
 		keys:      laneKeys{kind: got, tx: tx, rx: rx},
 		clientID:  clientID,
 		laneCount: laneCount,
+		userName:  userName,
 		assigned4: asg.V4Addr,
 		prefix4:   asg.V4Prefix,
 		peer4:     asg.V4Peer,
@@ -339,6 +374,36 @@ func acceptHandshake(c net.Conn, psk []byte, assignFn AssignFunc) (laneIdentity,
 		prefix6:   asg.V6Prefix,
 		peer6:     asg.V6Peer,
 	}, nil
+}
+
+// singlePSKResolver returns a pskResolver that always returns the
+// given PSK, ignoring the wire name. Used by the legacy single-PSK
+// server path.
+func singlePSKResolver(psk []byte) pskResolver {
+	return func(wireName [userNameLen]byte) ([]byte, string, error) {
+		return psk, decodeUserName(wireName), nil
+	}
+}
+
+// userDBResolver returns a pskResolver that selects the PSK matching
+// the wire name. A non-empty legacyPSK is returned when the wire name
+// is empty so old call sites with a single shared PSK still work; an
+// unknown name returns ErrUnknownUser.
+func userDBResolver(db *UserDB, legacyPSK []byte) pskResolver {
+	return func(wireName [userNameLen]byte) ([]byte, string, error) {
+		name := decodeUserName(wireName)
+		if name == "" {
+			if len(legacyPSK) == 0 {
+				return nil, "", fmt.Errorf("handshake: client did not send user name and no legacy PSK is configured")
+			}
+			return legacyPSK, "", nil
+		}
+		u := db.Lookup(wireName)
+		if u == nil {
+			return nil, "", ErrUnknownUser
+		}
+		return u.PSK, u.Name, nil
+	}
 }
 
 func hmacSHA256(key, data []byte) []byte {

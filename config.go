@@ -69,6 +69,10 @@ type ClientConfig struct {
 
 	// PSK enables the HMAC-based handshake. Required when Cipher != none.
 	PSK []byte
+	// UserName is sent in the handshake so a multi-user server can
+	// select the matching PSK in one lookup. Empty signals a
+	// legacy single-PSK server.
+	UserName string
 	// Cipher selects the AEAD for payload protection.
 	Cipher Cipher
 	// MPTCP enables Multipath TCP on the outer sockets.
@@ -115,9 +119,14 @@ type ServerConfig struct {
 	Lanes  int
 	Queues []PacketIO
 
-	// PSK enables the handshake. Required when clients connect with
-	// encryption set.
+	// PSK enables the handshake when no Users are configured (single
+	// shared PSK fallback). Required when clients connect with
+	// encryption set unless Users is populated.
 	PSK []byte
+	// Users, when non-empty, switches the server into per-user
+	// identity mode. Each connecting client must name a configured
+	// user in the handshake; the matching PSK is verified.
+	Users []User
 	// AllowIP, if non-empty, restricts accepted connections to this source
 	// IP. The check happens before the handshake.
 	AllowIP string
@@ -180,9 +189,10 @@ func (c ServerConfig) Validate() error {
 	if c.Listen == "" {
 		return errors.New("packethose server: Listen is required")
 	}
+	hasAuth := len(c.PSK) > 0 || len(c.Users) > 0
 	if c.Subnet.IsValid() || c.Subnet6.IsValid() {
-		if len(c.PSK) == 0 {
-			return errors.New("packethose server: multi-client mode requires PSK")
+		if !hasAuth {
+			return errors.New("packethose server: multi-client mode requires PSK or Users")
 		}
 		if c.Subnet.IsValid() {
 			if !c.ServerIP.IsValid() || !c.ServerIP.Is4() {

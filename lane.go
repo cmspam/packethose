@@ -159,4 +159,5 @@ func tuneSocket(c net.Conn) {
 		_ = unix.SetsockoptInt(int(fd), unix.IPPROTO_TCP, unix.TCP_KEEPINTVL, 5)
 		_ = unix.SetsockoptInt(int(fd), unix.IPPROTO_TCP, unix.TCP_KEEPCNT, 3)
 	})
+	_ = applyBBR(c)
 }

@@ -11,4 +11,5 @@ require (
 require (
 	github.com/google/btree v1.1.2 // indirect
 	golang.org/x/time v0.7.0 // indirect
+	gopkg.in/yaml.v3 v3.0.1 // indirect
 )

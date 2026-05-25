@@ -119,15 +119,16 @@ func sleepJitter(ctx context.Context, d time.Duration) bool {
 
 // clientSource returns a connSource that dials peer over dialer and runs the
 // initiate-side handshake. clientID identifies this client; laneCount is the
-// total lanes this client will open (informational on server side). reqIP is
-// the IP the client prefers to be assigned (zero = any).
-func clientSource(peer string, psk []byte, cipher Cipher, dialer ContextDialer, clientID [clientIDLen]byte, laneCount byte, req AssignmentRequest) connSource {
+// total lanes this client will open (informational on server side). userName
+// is the on-wire identity used to select the matching PSK on the server.
+// reqIP is the IP the client prefers to be assigned (zero = any).
+func clientSource(peer string, psk []byte, cipher Cipher, dialer ContextDialer, userName string, clientID [clientIDLen]byte, laneCount byte, req AssignmentRequest) connSource {
 	return func(ctx context.Context) (net.Conn, laneIdentity, error) {
 		c, err := dialer.DialContext(ctx, "tcp", peer)
 		if err != nil {
 			return nil, laneIdentity{}, err
 		}
-		ident, err := initiateHandshake(c, psk, cipher, clientID, laneCount, req)
+		ident, err := initiateHandshake(c, psk, cipher, userName, clientID, laneCount, req)
 		if err != nil {
 			c.Close()
 			return nil, laneIdentity{}, err
@@ -163,7 +164,7 @@ func (p *serverPool) source() connSource {
 	}
 }
 
-func runAcceptLoop(ctx context.Context, ln net.Listener, allow string, psk []byte, pool *serverPool, logger *log.Logger) {
+func runAcceptLoop(ctx context.Context, ln net.Listener, allow string, resolve pskResolver, pool *serverPool, logger *log.Logger) {
 	for {
 		c, err := ln.Accept()
 		if err != nil {
@@ -183,7 +184,17 @@ func runAcceptLoop(ctx context.Context, ln net.Listener, allow string, psk []byt
 				continue
 			}
 		}
-		ident, err := acceptHandshake(c, psk, nil)
+		if resolve == nil {
+			// No PSK configured: bypass the handshake entirely.
+			select {
+			case pool.ready <- acceptedConn{c, laneIdentity{}}:
+			case <-ctx.Done():
+				c.Close()
+				return
+			}
+			continue
+		}
+		ident, err := acceptHandshake(c, resolve, nil)
 		if err != nil {
 			logger.Printf("handshake fail from %s: %v", c.RemoteAddr(), err)
 			c.Close()

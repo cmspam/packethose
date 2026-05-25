@@ -28,9 +28,10 @@ import (
 //      the TUN is deleted, pool slots released, sticky maps keep the
 //      address(es) so the same client gets the same allocation on
 //      reconnect.
-func multiClientLoop(ctx context.Context, ln net.Listener, cfg ServerConfig, pool4, pool6 *ipPool, logger *log.Logger) error {
+func multiClientLoop(ctx context.Context, ln net.Listener, cfg ServerConfig, users *UserDB, pool4, pool6 *ipPool, logger *log.Logger) error {
 	state := &mcState{
 		cfg:      cfg,
+		users:    users,
 		pool4:    pool4,
 		pool6:    pool6,
 		logger:   logger,
@@ -81,6 +82,7 @@ func multiClientLoop(ctx context.Context, ln net.Listener, cfg ServerConfig, poo
 
 type mcState struct {
 	cfg          ServerConfig
+	users        *UserDB
 	pool4, pool6 *ipPool
 	logger       *log.Logger
 
@@ -107,12 +109,19 @@ type session struct {
 }
 
 func (m *mcState) handleConn(ctx context.Context, c net.Conn) {
-	assignFn := func(clientID [clientIDLen]byte, req AssignmentRequest) AssignmentResponse {
+	var slotHeld string
+	assignFn := func(userName string, clientID [clientIDLen]byte, req AssignmentRequest) (AssignmentResponse, error) {
+		if m.users != nil && !m.users.Empty() {
+			if err := m.users.AcquireSlot(userName); err != nil {
+				return AssignmentResponse{}, err
+			}
+			slotHeld = userName
+		}
 		var resp AssignmentResponse
 		if m.pool4 != nil {
-			addr, err := m.pool4.Allocate(clientID, req.V4)
+			addr, err := m.pool4.AllocateFor(userName, clientID, req.V4, m.users)
 			if err != nil {
-				m.logger.Printf("ipPool v4: %v", err)
+				m.logger.Printf("ipPool v4 user=%q: %v", userName, err)
 			} else {
 				resp.V4Addr = addr
 				resp.V4Prefix = byte(m.cfg.Subnet.Bits())
@@ -120,28 +129,45 @@ func (m *mcState) handleConn(ctx context.Context, c net.Conn) {
 			}
 		}
 		if m.pool6 != nil {
-			addr, err := m.pool6.Allocate(clientID, req.V6)
+			addr, err := m.pool6.AllocateFor(userName, clientID, req.V6, m.users)
 			if err != nil {
-				m.logger.Printf("ipPool v6: %v", err)
+				m.logger.Printf("ipPool v6 user=%q: %v", userName, err)
 			} else {
 				resp.V6Addr = addr
 				resp.V6Prefix = byte(m.cfg.Subnet6.Bits())
 				resp.V6Peer = m.cfg.ServerIP6
 			}
 		}
-		return resp
+		return resp, nil
 	}
-	ident, err := acceptHandshake(c, m.cfg.PSK, assignFn)
+	var resolve pskResolver
+	if m.users != nil && !m.users.Empty() {
+		resolve = userDBResolver(m.users, m.cfg.PSK)
+	} else {
+		resolve = singlePSKResolver(m.cfg.PSK)
+	}
+	ident, err := acceptHandshake(c, resolve, assignFn)
 	if err != nil {
 		m.logger.Printf("handshake fail from %s: %v", c.RemoteAddr(), err)
 		c.Close()
+		if slotHeld != "" {
+			m.users.ReleaseSlot(slotHeld)
+		}
 		return
 	}
 	if !ident.hasAssignment() {
 		m.logger.Printf("multi-client server allocated no address for client; rejecting %s", c.RemoteAddr())
 		c.Close()
+		if slotHeld != "" {
+			m.users.ReleaseSlot(slotHeld)
+		}
 		return
 	}
+	defer func() {
+		if slotHeld != "" {
+			m.users.ReleaseSlot(slotHeld)
+		}
+	}()
 
 	sess, isNew, err := m.acquireSession(ctx, ident)
 	if err != nil {

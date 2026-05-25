@@ -116,23 +116,25 @@ func signalContext() (context.Context, context.CancelFunc) {
 func runServer(args []string) {
 	fs := flag.NewFlagSet("server", flag.ExitOnError)
 	var (
-		cf        commonFlags
-		listen    string
-		allow     string
-		subnet    string
-		serverIP  string
-		subnet6   string
-		serverIP6 string
-		tunPrefix string
+		cf         commonFlags
+		listen     string
+		allow      string
+		subnet     string
+		serverIP   string
+		subnet6    string
+		serverIP6  string
+		tunPrefix  string
+		configPath string
 	)
 	bindCommon(fs, &cf)
-	fs.StringVar(&listen, "listen", "0.0.0.0:4500", "TCP listen address")
+	fs.StringVar(&listen, "listen", "", "TCP listen address (default 0.0.0.0:4500)")
 	fs.StringVar(&allow, "allow", "", "if set, only accept from this source IP")
 	fs.StringVar(&subnet, "subnet", "", "multi-client IPv4 subnet (CIDR, e.g. 10.66.0.0/24); requires --psk")
 	fs.StringVar(&serverIP, "server-ip", "", "multi-client tunnel-side IPv4 server IP (required with --subnet)")
 	fs.StringVar(&subnet6, "subnet6", "", "multi-client IPv6 subnet (CIDR, e.g. fd00:66::/64); requires --psk")
 	fs.StringVar(&serverIP6, "server-ip6", "", "multi-client tunnel-side IPv6 server IP (required with --subnet6)")
-	fs.StringVar(&tunPrefix, "tun-prefix", "phose", "device-name prefix for per-client TUNs in multi-client mode")
+	fs.StringVar(&tunPrefix, "tun-prefix", "", "device-name prefix for per-client TUNs in multi-client mode (default phose)")
+	fs.StringVar(&configPath, "config", "", "path to YAML config (overlays beneath CLI flags)")
 	fs.Parse(args)
 
 	cipher, err := packethose.ParseCipher(cf.encrypt)
@@ -140,16 +142,15 @@ func runServer(args []string) {
 		log.Fatal(err)
 	}
 	psk := parsePSK(cf.pskHex)
-	if cipher != packethose.CipherNone && psk == nil {
+	if cipher != packethose.CipherNone && psk == nil && configPath == "" {
 		log.Fatalf("--encrypt %s requires --psk", cipher)
 	}
 
 	cfg := packethose.ServerConfig{
-		Listen:     listen,
-		PSK:        psk,
-		AllowIP:    allow,
-		MPTCP:      cf.mptcp,
-		TuneSocket: brutalTuner(cf.brutalMbps),
+		Listen:  listen,
+		PSK:     psk,
+		AllowIP: allow,
+		MPTCP:   cf.mptcp,
 	}
 
 	multiClient := false
@@ -179,10 +180,42 @@ func runServer(args []string) {
 		cfg.ServerIP6 = sIP
 		multiClient = true
 	}
-	if multiClient {
+	if tunPrefix != "" {
 		cfg.TUNPrefix = tunPrefix
-		cfg.VnetHdr = cf.vnetHdr
-	} else {
+	}
+
+	fileCfg, err := packethose.LoadFile(configPath)
+	if err != nil {
+		log.Fatal(err)
+	}
+	if err := fileCfg.ApplyServer(&cfg); err != nil {
+		log.Fatalf("apply config: %v", err)
+	}
+	if cfg.Listen == "" {
+		cfg.Listen = "0.0.0.0:4500"
+	}
+	if cfg.Subnet.IsValid() || cfg.Subnet6.IsValid() {
+		multiClient = true
+	}
+	if cfg.TUNPrefix == "" {
+		cfg.TUNPrefix = "phose"
+	}
+
+	// Phase A wires BBR per accepted socket. brutal_mbps still
+	// overrides per-socket congestion control when requested.
+	tunes := []func(net.Conn){}
+	wantBBR := fileCfg.WantBBR()
+	if wantBBR {
+		tunes = append(tunes, packethose.BBRTuner())
+	}
+	if t := brutalTuner(cf.brutalMbps); t != nil {
+		tunes = append(tunes, t)
+	} else if fileCfg.Brutal.Enabled && fileCfg.Brutal.RateMbps > 0 {
+		tunes = append(tunes, brutalTuner(fileCfg.Brutal.RateMbps))
+	}
+	cfg.TuneSocket = composeTuners(tunes)
+
+	if !multiClient {
 		queues, ifname, err := packethose.OpenKernelTUN(cf.tun, cf.lanes, cf.vnetHdr)
 		if err != nil {
 			log.Fatalf("open tun: %v", err)
@@ -190,11 +223,16 @@ func runServer(args []string) {
 		log.Printf("opened %d TUN queues on %s (vnet_hdr=%v)", cf.lanes, ifname, cf.vnetHdr)
 		cfg.Lanes = cf.lanes
 		cfg.Queues = queues
+	} else if !cfg.VnetHdr {
+		cfg.VnetHdr = cf.vnetHdr
 	}
 
 	srv, err := packethose.NewServer(cfg)
 	if err != nil {
 		log.Fatalf("server: %v", err)
+	}
+	if wantBBR && !packethose.BBRAvailable() {
+		log.Printf("warn: BBR requested but not in tcp_allowed_congestion_control; running with kernel default")
 	}
 	ctx, cancel := signalContext()
 	defer cancel()
@@ -204,20 +242,38 @@ func runServer(args []string) {
 	log.Printf("server exiting")
 }
 
+func composeTuners(tunes []func(net.Conn)) func(net.Conn) {
+	if len(tunes) == 0 {
+		return nil
+	}
+	if len(tunes) == 1 {
+		return tunes[0]
+	}
+	return func(c net.Conn) {
+		for _, t := range tunes {
+			if t != nil {
+				t(c)
+			}
+		}
+	}
+}
+
 func runClient(args []string) {
 	fs := flag.NewFlagSet("client", flag.ExitOnError)
 	var (
-		cf      commonFlags
-		peer    string
-		reqIP   string
-		reqIP6  string
-		autoIP  bool
+		cf       commonFlags
+		peer     string
+		reqIP    string
+		reqIP6   string
+		autoIP   bool
+		userName string
 	)
 	bindCommon(fs, &cf)
 	fs.StringVar(&peer, "peer", "", "TCP peer address:port (required)")
 	fs.StringVar(&reqIP, "request-ip", "", "preferred IPv4 to ask the server for (multi-client mode)")
 	fs.StringVar(&reqIP6, "request-ip6", "", "preferred IPv6 to ask the server for (multi-client mode)")
 	fs.BoolVar(&autoIP, "auto-ip", false, "apply the server-assigned IP(s) to the TUN device automatically")
+	fs.StringVar(&userName, "user", "", "user name to send in the handshake when the server is in multi-user mode")
 	fs.Parse(args)
 	if peer == "" {
 		log.Fatalf("--peer is required")
@@ -252,14 +308,19 @@ func runClient(args []string) {
 		}
 	}
 
+	tunes := []func(net.Conn){packethose.BBRTuner()}
+	if t := brutalTuner(cf.brutalMbps); t != nil {
+		tunes = append(tunes, t)
+	}
 	clicfg := packethose.ClientConfig{
 		Peer:       peer,
 		Lanes:      cf.lanes,
 		Queues:     queues,
 		PSK:        psk,
+		UserName:   userName,
 		Cipher:     cipher,
 		MPTCP:      cf.mptcp,
-		TuneSocket: brutalTuner(cf.brutalMbps),
+		TuneSocket: composeTuners(tunes),
 		RequestIP:  reqAddr4,
 		RequestIP6: reqAddr6,
 	}
