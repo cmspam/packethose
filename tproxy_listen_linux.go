@@ -240,9 +240,19 @@ func closeWrite(c net.Conn) {
 }
 
 // inPool reports whether addr falls inside either configured pool
-// subnet. Used by the isolation gate.
+// subnet, excluding the server's own tunnel IPs. The server's IP is
+// in the pool subnet by definition; without this exemption the
+// isolation gate would forbid clients from reaching services bound
+// to the server's tunnel IP, breaking iperf3 to the server,
+// administrative sshd, etc.
 func (t *TPROXYListener) inPool(addr netip.Addr) bool {
 	if !addr.IsValid() {
+		return false
+	}
+	if t.cfg.ServerIP4.IsValid() && addr == t.cfg.ServerIP4 {
+		return false
+	}
+	if t.cfg.ServerIP6.IsValid() && addr == t.cfg.ServerIP6 {
 		return false
 	}
 	if t.cfg.PoolV4.IsValid() && t.cfg.PoolV4.Contains(addr) {

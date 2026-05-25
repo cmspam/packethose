@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"net/netip"
 	"os/exec"
 	"strconv"
 	"strings"
@@ -60,6 +61,16 @@ type NFTConfig struct {
 	RouteTable uint32
 	IPv4       bool
 	IPv6       bool
+
+	// ServerIP4 and ServerIP6 are the server's own tunnel-side
+	// addresses (e.g. 10.66.0.1 and fd00:66::1). When TPROXY is
+	// enabled, packets destined to these addresses are accepted in
+	// the prerouting chain before the tproxy redirect, so a client
+	// can reach services on the server's tunnel IP (iperf3, sshd
+	// bound to it) via the kernel's normal local delivery path
+	// rather than looping through the tproxy listener.
+	ServerIP4 netip.Addr
+	ServerIP6 netip.Addr
 }
 
 // nftBin is the nftables(8) binary path. Overridable for tests.
@@ -198,6 +209,17 @@ func (n *NFTInstaller) buildScript() string {
 	if n.cfg.TPROXY {
 		fmt.Fprintf(&b, "  chain prerouting {\n")
 		fmt.Fprintf(&b, "    type filter hook prerouting priority mangle; policy accept;\n")
+		// Traffic destined to the server's own tunnel IPs is accepted
+		// before the tproxy redirect so clients can reach services
+		// bound to those addresses (iperf3 -s -B 10.66.0.1,
+		// administrative sshd on the tunnel-IP, etc.) without
+		// looping through the tproxy listener.
+		if n.cfg.IPv4 && n.cfg.ServerIP4.IsValid() {
+			fmt.Fprintf(&b, "    iifname %q ip daddr %s accept\n", n.cfg.TUNMatch, n.cfg.ServerIP4.String())
+		}
+		if n.cfg.IPv6 && n.cfg.ServerIP6.IsValid() {
+			fmt.Fprintf(&b, "    iifname %q ip6 daddr %s accept\n", n.cfg.TUNMatch, n.cfg.ServerIP6.String())
+		}
 		if n.cfg.IPv4 {
 			fmt.Fprintf(&b, "    iifname %q meta l4proto { tcp, udp } tproxy ip to :%d meta mark set %#x accept\n",
 				n.cfg.TUNMatch, n.cfg.TPROXYPort, n.cfg.TPROXYMark)

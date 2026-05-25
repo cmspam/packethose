@@ -210,6 +210,13 @@ type TPROXYConfig struct {
 	// at startup so the listener does not need a back-reference.
 	PoolV4 netip.Prefix
 	PoolV6 netip.Prefix
+
+	// ServerIP4 / ServerIP6 are the server's own tunnel-side
+	// addresses. The isolation check exempts these so clients can
+	// always reach services bound to the server's tunnel IP even
+	// when the IP falls inside the pool subnet.
+	ServerIP4 netip.Addr
+	ServerIP6 netip.Addr
 }
 
 // Validate returns nil if the config is internally consistent.

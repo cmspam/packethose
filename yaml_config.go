@@ -240,6 +240,8 @@ func (fc FileConfig) applyForward(cfg *ServerConfig) error {
 		RouteTable:      fwd.TPROXYTable,
 		IPv4:            cfg.Subnet.IsValid() || (!cfg.Subnet.IsValid() && !cfg.Subnet6.IsValid()),
 		IPv6:            cfg.Subnet6.IsValid(),
+		ServerIP4:       cfg.ServerIP,
+		ServerIP6:       cfg.ServerIP6,
 	}
 
 	// TPROXY listener: enabled by default when forward.tproxy is on.
@@ -253,6 +255,8 @@ func (fc FileConfig) applyForward(cfg *ServerConfig) error {
 		ListenPort: fwd.TPROXYListenPort,
 		PoolV4:     cfg.Subnet,
 		PoolV6:     cfg.Subnet6,
+		ServerIP4:  cfg.ServerIP,
+		ServerIP6:  cfg.ServerIP6,
 	}
 	if fc.TPROXY.ListenPort != 0 {
 		cfg.TPROXY.ListenPort = fc.TPROXY.ListenPort
