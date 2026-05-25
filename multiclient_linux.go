@@ -92,6 +92,7 @@ type mcState struct {
 
 type session struct {
 	id        [clientIDLen]byte
+	userName  string
 	assigned4 netip.Addr
 	assigned6 netip.Addr
 	tunName   string
@@ -109,14 +110,10 @@ type session struct {
 }
 
 func (m *mcState) handleConn(ctx context.Context, c net.Conn) {
-	var slotHeld string
 	assignFn := func(userName string, clientID [clientIDLen]byte, req AssignmentRequest) (AssignmentResponse, error) {
-		if m.users != nil && !m.users.Empty() {
-			if err := m.users.AcquireSlot(userName); err != nil {
-				return AssignmentResponse{}, err
-			}
-			slotHeld = userName
-		}
+		// Quota is enforced on session creation in acquireSession, not
+		// here: every lane handshakes, and a per-handshake AcquireSlot
+		// would reject every lane after the first.
 		var resp AssignmentResponse
 		if m.pool4 != nil {
 			addr, err := m.pool4.AllocateFor(userName, clientID, req.V4, m.users)
@@ -150,24 +147,13 @@ func (m *mcState) handleConn(ctx context.Context, c net.Conn) {
 	if err != nil {
 		m.logger.Printf("handshake fail from %s: %v", c.RemoteAddr(), err)
 		c.Close()
-		if slotHeld != "" {
-			m.users.ReleaseSlot(slotHeld)
-		}
 		return
 	}
 	if !ident.hasAssignment() {
 		m.logger.Printf("multi-client server allocated no address for client; rejecting %s", c.RemoteAddr())
 		c.Close()
-		if slotHeld != "" {
-			m.users.ReleaseSlot(slotHeld)
-		}
 		return
 	}
-	defer func() {
-		if slotHeld != "" {
-			m.users.ReleaseSlot(slotHeld)
-		}
-	}()
 
 	sess, isNew, err := m.acquireSession(ctx, ident)
 	if err != nil {
@@ -220,6 +206,17 @@ func (m *mcState) acquireSession(parent context.Context, ident laneIdentity) (*s
 		m.mu.Unlock()
 		return s, false, nil
 	}
+	// First lane for this clientID: a new session is about to open.
+	// Check the user's max_concurrent against existing sessions for
+	// the same user. Counting by session (not by lane) is the whole
+	// point of moving the AcquireSlot here.
+	if m.users != nil && !m.users.Empty() {
+		if err := m.users.AcquireSlot(ident.userName); err != nil {
+			m.mu.Unlock()
+			m.releaseAll(ident.clientID)
+			return nil, false, err
+		}
+	}
 	laneCount := int(ident.laneCount)
 	if laneCount < 1 {
 		laneCount = 1
@@ -231,18 +228,25 @@ func (m *mcState) acquireSession(parent context.Context, ident laneIdentity) (*s
 	queues, ifname, err := OpenKernelTUN(tunName, laneCount, m.cfg.VnetHdr)
 	if err != nil {
 		m.mu.Unlock()
+		if m.users != nil && !m.users.Empty() {
+			m.users.ReleaseSlot(ident.userName)
+		}
 		m.releaseAll(ident.clientID)
 		return nil, false, fmt.Errorf("open tun %s: %w", tunName, err)
 	}
 	if err := configureSessionInterface(ifname, ident.assigned4, ident.assigned6); err != nil {
 		closeAll(queues)
 		m.mu.Unlock()
+		if m.users != nil && !m.users.Empty() {
+			m.users.ReleaseSlot(ident.userName)
+		}
 		m.releaseAll(ident.clientID)
 		return nil, false, fmt.Errorf("configure %s: %w", ifname, err)
 	}
 	ctx, cancel := context.WithCancel(parent)
 	s := &session{
 		id:        ident.clientID,
+		userName:  ident.userName,
 		assigned4: ident.assigned4,
 		assigned6: ident.assigned6,
 		tunName:   ifname,
@@ -325,6 +329,9 @@ func (m *mcState) tearDown(s *session) {
 	closeAll(s.queues)
 	_ = exec.Command("ip", "link", "del", s.tunName).Run()
 	m.releaseAll(s.id)
+	if s.userName != "" && m.users != nil {
+		m.users.ReleaseSlot(s.userName)
+	}
 	m.logger.Printf("session %x: torn down (tun %s)", s.id[:4], s.tunName)
 }
 
