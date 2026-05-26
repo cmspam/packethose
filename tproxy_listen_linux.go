@@ -13,6 +13,7 @@ import (
 	"net/netip"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -20,14 +21,20 @@ import (
 )
 
 // TPROXYListener terminates client TCP and UDP flows redirected by
-// the nftables prerouting hook. For TCP it accepts the redirected
-// connection, retrieves the original destination via SO_ORIGINAL_DST
-// (v4) or IP6T_SO_ORIGINAL_DST (v6), dials that destination directly,
-// and splices the two TCPConn endpoints with io.Copy so the Go
-// runtime engages splice(). For UDP it demultiplexes per source/dst
-// flow and forwards via an unconnected UDP socket; replies traverse
-// a per-flow IP_TRANSPARENT socket bound to the original destination
-// so the client sees responses from the right source.
+// the nftables prerouting hook.
+//
+// TCP: accept the redirected connection (LocalAddr() is the original
+// destination because the listener is IP_TRANSPARENT), tune both the
+// accepted socket and the outbound dial for high-throughput
+// forwarding (BBR, 4 MiB buffers, TCP_NODELAY, keepalive), then let
+// the Go runtime splice() bytes between the two *net.TCPConn ends.
+//
+// UDP: a single recvmsg loop fans incoming datagrams out to per-flow
+// state. Each flow holds a *connected* upstream UDP socket (so the
+// kernel skips per-packet routing lookup), an IP_TRANSPARENT reply
+// socket bound to the original destination (so the client sees
+// responses from the IP it tried to reach), and a sync.Pool-backed
+// buffer reuse so the data plane allocates nothing per packet.
 type TPROXYListener struct {
 	cfg    TPROXYConfig
 	logger *log.Logger
@@ -36,6 +43,12 @@ type TPROXYListener struct {
 	udpPC  net.PacketConn
 	closed chan struct{}
 	wg     sync.WaitGroup
+}
+
+// udpBufPool reuses 64 KiB buffers across UDP recvs to avoid per-
+// packet allocation pressure in the data plane.
+var udpBufPool = sync.Pool{
+	New: func() any { b := make([]byte, 65535); return &b },
 }
 
 // NewTPROXYListener validates cfg and returns a listener. Call Start
@@ -82,8 +95,8 @@ func (t *TPROXYListener) Start(ctx context.Context) error {
 	}
 	t.udpPC = udpPC
 
-	t.logger.Printf("tproxy: listening on %s (isolation=%v pool4=%s pool6=%s)",
-		addr, t.cfg.EnforceIsolation, t.cfg.PoolV4, t.cfg.PoolV6)
+	t.logger.Printf("tproxy: listening on %s (isolation=%v pool4=%s pool6=%s bbr=%v)",
+		addr, t.cfg.EnforceIsolation, t.cfg.PoolV4, t.cfg.PoolV6, BBRAvailable())
 
 	t.wg.Add(2)
 	go t.tcpAcceptLoop(ctx)
@@ -111,10 +124,9 @@ func (t *TPROXYListener) Stop() {
 	t.wg.Wait()
 }
 
-// tproxyTCPControl sets IP_TRANSPARENT (and IPV6_TRANSPARENT when the
-// kernel accepts it) on the TCP listening socket so the kernel
-// delivers redirected SYNs to this socket instead of the real
-// destination's port.
+// tproxyTCPControl arms the TCP listening socket for redirected
+// flows: IP_TRANSPARENT so SYNs for non-local destinations land here,
+// SO_REUSEADDR so restarts don't TIME_WAIT-block.
 func tproxyTCPControl(network, address string, c syscall.RawConn) error {
 	var setErr error
 	err := c.Control(func(fd uintptr) {
@@ -147,11 +159,68 @@ func tproxyUDPControl(network, address string, c syscall.RawConn) error {
 		_ = unix.SetsockoptInt(int(fd), unix.IPPROTO_IP, unix.IP_RECVORIGDSTADDR, 1)
 		_ = unix.SetsockoptInt(int(fd), unix.IPPROTO_IPV6, unix.IPV6_RECVORIGDSTADDR, 1)
 		_ = unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_REUSEADDR, 1)
+		// 8 MiB recv buffer absorbs bursts from many concurrent flows
+		// while the userspace loop catches up. Without this the kernel
+		// drops on burst overflow at default ~256 KB.
+		_ = unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_RCVBUF, 8<<20)
 	})
 	if err != nil {
 		return err
 	}
 	return setErr
+}
+
+// tuneTCP applies the per-flow socket options that turn an ordinary
+// forwarded TCP connection into a high-throughput one: BBR
+// congestion control (kernel default is often cubic, which underruns
+// long fat pipes), 4 MiB send + recv buffers (kernel autotunes but
+// the floor is sometimes too low), TCP_NODELAY (no Nagle delay since
+// we may be carrying interactive bytes), keepalive to drop dead
+// peers. Errors are deliberately swallowed: failing to tune doesn't
+// break the forward; it just leaves performance on the table.
+func tuneTCP(c net.Conn) {
+	tc, ok := c.(*net.TCPConn)
+	if !ok {
+		return
+	}
+	_ = tc.SetNoDelay(true)
+	_ = tc.SetKeepAlive(true)
+	_ = tc.SetKeepAlivePeriod(30 * time.Second)
+	sc, err := tc.SyscallConn()
+	if err != nil {
+		return
+	}
+	_ = sc.Control(func(fd uintptr) {
+		// 4 MiB each direction. Linux silently caps at
+		// net.core.{r,w}mem_max, which is 4 MiB on most distros and
+		// boosted to 32 MiB on our bench hosts; setting 4 MiB is a
+		// reasonable floor without needing operator tuning.
+		_ = unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_SNDBUF, 4<<20)
+		_ = unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_RCVBUF, 4<<20)
+		// TCP_USER_TIMEOUT: kill the conn after 30s of no ACK so a
+		// stalled forward doesn't pin resources indefinitely.
+		_ = unix.SetsockoptInt(int(fd), unix.IPPROTO_TCP, unix.TCP_USER_TIMEOUT, 30000)
+	})
+	_ = applyBBR(c)
+}
+
+// tunedTCPDialer returns a *net.Dialer that arms outgoing TCP sockets
+// with BBR and large buffers via the Control hook, so the tuning is
+// in effect from the very first SYN (cwnd ramps faster).
+func tunedTCPDialer(timeout time.Duration) *net.Dialer {
+	return &net.Dialer{
+		Timeout:   timeout,
+		KeepAlive: 30 * time.Second,
+		Control: func(network, address string, c syscall.RawConn) error {
+			return c.Control(func(fd uintptr) {
+				_ = unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_SNDBUF, 4<<20)
+				_ = unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_RCVBUF, 4<<20)
+				if bbrAvailable() {
+					_ = unix.SetsockoptString(int(fd), unix.IPPROTO_TCP, unix.TCP_CONGESTION, "bbr")
+				}
+			})
+		},
+	}
 }
 
 func (t *TPROXYListener) tcpAcceptLoop(ctx context.Context) {
@@ -174,12 +243,10 @@ func (t *TPROXYListener) tcpAcceptLoop(ctx context.Context) {
 	}
 }
 
-// handleTCP runs one accepted client flow: read the original
-// destination, optionally reject by isolation, dial out, splice both
-// ends. The client side is a redirected accept so LocalAddr() returns
-// the original destination already; SO_ORIGINAL_DST is needed only on
-// nf_conntrack REDIRECT, not on TPROXY. We still recover via
-// LocalAddr.
+// handleTCP runs one accepted client flow. The accepted socket's
+// LocalAddr() is the original destination (TPROXY preserves it).
+// Both the client-side and upstream-side TCPConns are tuned before
+// io.Copy engages splice(2) on the pair.
 func (t *TPROXYListener) handleTCP(ctx context.Context, client net.Conn) {
 	defer client.Close()
 	dst, err := originalTCPDst(client)
@@ -188,15 +255,15 @@ func (t *TPROXYListener) handleTCP(ctx context.Context, client net.Conn) {
 		return
 	}
 	if t.cfg.EnforceIsolation && t.inPool(dst.Addr()) {
-		// Inter-client traffic. Drop silently; clients see RST.
 		return
 	}
-	dialer := &net.Dialer{Timeout: 10 * time.Second}
-	upstream, err := dialer.DialContext(ctx, "tcp", dst.String())
+	tuneTCP(client)
+	upstream, err := tunedTCPDialer(10 * time.Second).DialContext(ctx, "tcp", dst.String())
 	if err != nil {
 		return
 	}
 	defer upstream.Close()
+	tuneTCP(upstream)
 	relayTCP(client, upstream)
 }
 
@@ -240,11 +307,7 @@ func closeWrite(c net.Conn) {
 }
 
 // inPool reports whether addr falls inside either configured pool
-// subnet, excluding the server's own tunnel IPs. The server's IP is
-// in the pool subnet by definition; without this exemption the
-// isolation gate would forbid clients from reaching services bound
-// to the server's tunnel IP, breaking iperf3 to the server,
-// administrative sshd, etc.
+// subnet, excluding the server's own tunnel IPs.
 func (t *TPROXYListener) inPool(addr netip.Addr) bool {
 	if !addr.IsValid() {
 		return false
@@ -264,16 +327,32 @@ func (t *TPROXYListener) inPool(addr netip.Addr) bool {
 	return false
 }
 
-// tproxyUDPFlow is one active (src, dst) UDP session.
+// tproxyUDPFlow is one active (src, dst) UDP session. The upstream
+// socket is *connected* to dst: the kernel resolves the route once at
+// connect time and reuses it for every send, skipping per-packet
+// route lookup. The reply socket is IP_TRANSPARENT-bound to dst so
+// the client sees responses from the address it tried to reach.
 type tproxyUDPFlow struct {
-	src      netip.AddrPort
-	dst      netip.AddrPort
-	queue    chan []byte
-	upstream net.PacketConn
-	reply    net.PacketConn
-	done     chan struct{}
-	closeOne sync.Once
-	lastSeen time.Time
+	src          netip.AddrPort
+	dst          netip.AddrPort
+	upstream     *net.UDPConn
+	reply        *net.UDPConn
+	clientAddr   *net.UDPAddr
+	lastActivity atomic.Int64 // unix-nano of most recent traffic
+	closed       atomic.Bool
+	closeCh      chan struct{}
+	closeOnce    sync.Once
+}
+
+func (f *tproxyUDPFlow) bump() { f.lastActivity.Store(time.Now().UnixNano()) }
+
+func (f *tproxyUDPFlow) shutdown() {
+	f.closeOnce.Do(func() {
+		f.closed.Store(true)
+		close(f.closeCh)
+		_ = f.upstream.Close()
+		_ = f.reply.Close()
+	})
 }
 
 func (t *TPROXYListener) udpAcceptLoop(ctx context.Context) {
@@ -288,10 +367,13 @@ func (t *TPROXYListener) udpAcceptLoop(ctx context.Context) {
 		t.logger.Printf("tproxy udp: SyscallConn: %v", err)
 		return
 	}
+
 	flowsMu := sync.Mutex{}
 	flows := map[string]*tproxyUDPFlow{}
 
-	buf := make([]byte, 65535)
+	// Pre-allocated buffers for the accept-loop's recv path. The
+	// payload buffer is pooled separately so it can travel with the
+	// per-flow write op without holding the accept-loop hostage.
 	cbuf := make([]byte, 1024)
 	for {
 		select {
@@ -300,6 +382,9 @@ func (t *TPROXYListener) udpAcceptLoop(ctx context.Context) {
 		default:
 		}
 		_ = udpConn.SetReadDeadline(time.Now().Add(1 * time.Second))
+
+		bufPtr := udpBufPool.Get().(*[]byte)
+		buf := *bufPtr
 		var n, oobn int
 		var srcSA unix.Sockaddr
 		var rerr error
@@ -311,6 +396,7 @@ func (t *TPROXYListener) udpAcceptLoop(ctx context.Context) {
 			rerr = cerr
 		}
 		if rerr != nil {
+			udpBufPool.Put(bufPtr)
 			select {
 			case <-t.closed:
 				return
@@ -329,19 +415,20 @@ func (t *TPROXYListener) udpAcceptLoop(ctx context.Context) {
 			continue
 		}
 		if n <= 0 {
+			udpBufPool.Put(bufPtr)
 			continue
 		}
 		src := sockaddrToAddrPort(srcSA)
 		dst, dstOK := origDstFromCmsg(cbuf[:oobn])
 		if !dstOK {
+			udpBufPool.Put(bufPtr)
 			continue
 		}
 		if t.cfg.EnforceIsolation && t.inPool(dst.Addr()) {
+			udpBufPool.Put(bufPtr)
 			continue
 		}
 		key := src.String() + "|" + dst.String()
-		payload := make([]byte, n)
-		copy(payload, buf[:n])
 
 		flowsMu.Lock()
 		flow, exists := flows[key]
@@ -349,131 +436,132 @@ func (t *TPROXYListener) udpAcceptLoop(ctx context.Context) {
 			f, err := t.openUDPFlow(ctx, src, dst)
 			if err != nil {
 				flowsMu.Unlock()
+				udpBufPool.Put(bufPtr)
 				continue
 			}
 			flow = f
 			flows[key] = f
 			t.wg.Add(1)
-			go t.runUDPFlow(ctx, f, &flowsMu, flows, key)
+			go t.runUDPReplyPump(ctx, f, &flowsMu, flows, key)
 		}
-		flow.lastSeen = time.Now()
+		flow.bump()
 		flowsMu.Unlock()
 
-		select {
-		case flow.queue <- payload:
-		default:
-		}
+		// Connected upstream socket: kernel knows where these bytes
+		// are going, no per-packet route lookup. Direct write from
+		// the accept loop avoids the channel hop and the second
+		// allocation we used to do.
+		_, _ = flow.upstream.Write(buf[:n])
+		udpBufPool.Put(bufPtr)
 	}
 }
 
-// openUDPFlow allocates a per-flow upstream socket and a per-flow
-// reply socket. The reply socket is IP_TRANSPARENT-bound to the
-// original destination so the client sees responses from the address
-// it tried to reach.
+// openUDPFlow allocates a per-flow connected upstream socket and a
+// per-flow IP_TRANSPARENT reply socket. Connected upstream skips
+// per-packet routing; reply is bound to dst so client sees the right
+// source on replies.
 func (t *TPROXYListener) openUDPFlow(ctx context.Context, src, dst netip.AddrPort) (*tproxyUDPFlow, error) {
-	upstream, err := net.ListenPacket("udp", ":0")
+	dstAddr := &net.UDPAddr{IP: dst.Addr().AsSlice(), Port: int(dst.Port())}
+	upstreamRaw, err := net.DialUDP("udp", nil, dstAddr)
 	if err != nil {
 		return nil, err
 	}
+	// Big UDP buffers so a bursty server reply doesn't drop in the
+	// kernel before we read.
+	if sc, err := upstreamRaw.SyscallConn(); err == nil {
+		_ = sc.Control(func(fd uintptr) {
+			_ = unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_SNDBUF, 4<<20)
+			_ = unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_RCVBUF, 4<<20)
+		})
+	}
+
 	replyLC := net.ListenConfig{Control: tproxyUDPControl}
-	replyAddr := &net.UDPAddr{IP: dst.Addr().AsSlice(), Port: int(dst.Port())}
-	reply, err := replyLC.ListenPacket(ctx, "udp", replyAddr.String())
+	replyPC, err := replyLC.ListenPacket(ctx, "udp", dstAddr.String())
 	if err != nil {
-		_ = upstream.Close()
+		_ = upstreamRaw.Close()
 		return nil, err
 	}
-	return &tproxyUDPFlow{
-		src:      src,
-		dst:      dst,
-		queue:    make(chan []byte, 64),
-		upstream: upstream,
-		reply:    reply,
-		done:     make(chan struct{}),
-		lastSeen: time.Now(),
-	}, nil
+	reply, ok := replyPC.(*net.UDPConn)
+	if !ok {
+		_ = replyPC.Close()
+		_ = upstreamRaw.Close()
+		return nil, fmt.Errorf("tproxy udp reply: PacketConn not *net.UDPConn")
+	}
+	clientAddr := &net.UDPAddr{IP: src.Addr().AsSlice(), Port: int(src.Port())}
+
+	f := &tproxyUDPFlow{
+		src:        src,
+		dst:        dst,
+		upstream:   upstreamRaw,
+		reply:      reply,
+		clientAddr: clientAddr,
+		closeCh:    make(chan struct{}),
+	}
+	f.bump()
+	return f, nil
 }
 
-// runUDPFlow bridges datagrams in both directions for one flow.
-// Client packets arrive on flow.queue and go out via flow.upstream;
-// upstream replies come back on flow.upstream and go to the client
-// via flow.reply (which spoofs the destination address).
+// runUDPReplyPump pulls server→client packets off the upstream socket
+// and sprays them back to the client via the IP_TRANSPARENT reply
+// socket. One goroutine per flow handles only this direction; the
+// client→server direction is handled inline by the accept loop using
+// the connected upstream socket. This halves the goroutine count
+// vs the per-direction model and removes the queue-channel copy.
 //
-// Both directions close the shared f.done channel on exit so the
-// other direction unblocks immediately. The deferred cleanup closes
-// both sockets and removes the flow from the map. Without this
-// cross-signal, a stalled upstream (inner returns on read timeout)
-// would leave the outer loop waiting on its own idle timer, holding
-// the IP_TRANSPARENT reply socket bound to dst:port for up to
-// UDPIdleTimeout after the flow effectively ended.
-func (t *TPROXYListener) runUDPFlow(ctx context.Context, f *tproxyUDPFlow, mu *sync.Mutex, flows map[string]*tproxyUDPFlow, key string) {
+// Exit conditions: idle timeout (no traffic for cfg.UDPIdleTimeout),
+// upstream socket closed, or listener shutdown.
+func (t *TPROXYListener) runUDPReplyPump(ctx context.Context, f *tproxyUDPFlow, mu *sync.Mutex, flows map[string]*tproxyUDPFlow, key string) {
 	defer t.wg.Done()
 	defer func() {
 		mu.Lock()
-		delete(flows, key)
-		mu.Unlock()
-		f.closeOne.Do(func() { close(f.done) })
-		_ = f.upstream.Close()
-		_ = f.reply.Close()
-	}()
-
-	clientAddr := &net.UDPAddr{IP: f.src.Addr().AsSlice(), Port: int(f.src.Port())}
-	dstAddr := &net.UDPAddr{IP: f.dst.Addr().AsSlice(), Port: int(f.dst.Port())}
-
-	// upstream-to-client goroutine: read from the per-flow upstream
-	// socket and write back through the IP_TRANSPARENT reply socket
-	// so the client sees the original destination as source. On any
-	// exit, close f.done so the outer client-to-upstream loop wakes
-	// up and the deferred socket cleanup runs.
-	t.wg.Add(1)
-	go func() {
-		defer t.wg.Done()
-		defer f.closeOne.Do(func() { close(f.done) })
-		buf := make([]byte, 65535)
-		for {
-			select {
-			case <-f.done:
-				return
-			default:
-			}
-			_ = f.upstream.SetReadDeadline(time.Now().Add(t.cfg.UDPIdleTimeout))
-			n, _, err := f.upstream.ReadFrom(buf)
-			if err != nil {
-				return
-			}
-			if n <= 0 {
-				continue
-			}
-			if _, err := f.reply.WriteTo(buf[:n], clientAddr); err != nil {
-				return
-			}
+		if flows[key] == f {
+			delete(flows, key)
 		}
+		mu.Unlock()
+		f.shutdown()
 	}()
 
-	// client-to-upstream loop: pull from queue, write to upstream.
-	idle := time.NewTimer(t.cfg.UDPIdleTimeout)
-	defer idle.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-t.closed:
 			return
-		case <-f.done:
+		case <-f.closeCh:
 			return
-		case data := <-f.queue:
-			if _, err := f.upstream.WriteTo(data, dstAddr); err != nil {
-				return
+		default:
+		}
+		// Recompute the idle deadline from lastActivity. The accept
+		// loop bumps on every client packet and we bump here on each
+		// upstream packet, so the deadline accurately tracks the
+		// most recent traffic in either direction.
+		last := time.Unix(0, f.lastActivity.Load())
+		deadline := last.Add(t.cfg.UDPIdleTimeout)
+		if !deadline.After(time.Now()) {
+			return // genuinely idle past timeout
+		}
+		_ = f.upstream.SetReadDeadline(deadline)
+
+		bufPtr := udpBufPool.Get().(*[]byte)
+		buf := *bufPtr
+		n, _, err := f.upstream.ReadFromUDP(buf)
+		if err != nil {
+			udpBufPool.Put(bufPtr)
+			var ne net.Error
+			if errors.As(err, &ne) && ne.Timeout() {
+				// Could be activity-bump while we were blocked. Loop
+				// to recompute the deadline.
+				continue
 			}
-			if !idle.Stop() {
-				select {
-				case <-idle.C:
-				default:
-				}
-			}
-			idle.Reset(t.cfg.UDPIdleTimeout)
-		case <-idle.C:
 			return
 		}
+		if n <= 0 {
+			udpBufPool.Put(bufPtr)
+			continue
+		}
+		f.bump()
+		_, _ = f.reply.WriteToUDP(buf[:n], f.clientAddr)
+		udpBufPool.Put(bufPtr)
 	}
 }
 
