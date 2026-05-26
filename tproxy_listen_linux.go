@@ -16,6 +16,7 @@ import (
 	"sync/atomic"
 	"syscall"
 	"time"
+	"unsafe"
 
 	"golang.org/x/sys/unix"
 )
@@ -126,7 +127,10 @@ func (t *TPROXYListener) Stop() {
 
 // tproxyTCPControl arms the TCP listening socket for redirected
 // flows: IP_TRANSPARENT so SYNs for non-local destinations land here,
-// SO_REUSEADDR so restarts don't TIME_WAIT-block.
+// SO_REUSEADDR so restarts don't TIME_WAIT-block, and TCP_FASTOPEN
+// so the listener accepts SYN+data on the first packet — sing-box
+// also enables this and it saves one RTT on every new connection.
+// Backlog 256 mirrors the kernel default for TFO queue depth.
 func tproxyTCPControl(network, address string, c syscall.RawConn) error {
 	var setErr error
 	err := c.Control(func(fd uintptr) {
@@ -137,6 +141,7 @@ func tproxyTCPControl(network, address string, c syscall.RawConn) error {
 			return
 		}
 		_ = unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_REUSEADDR, 1)
+		_ = unix.SetsockoptInt(int(fd), unix.IPPROTO_TCP, unix.TCP_FASTOPEN, 256)
 	})
 	if err != nil {
 		return err
@@ -145,8 +150,12 @@ func tproxyTCPControl(network, address string, c syscall.RawConn) error {
 }
 
 // tproxyUDPControl mirrors tproxyTCPControl for UDP and additionally
-// asks the kernel to deliver the original-destination cmsg with each
-// recvmsg.
+// asks the kernel to deliver the original-destination + TOS/Class
+// cmsgs on each recvmmsg. The TOS/Class cmsg lets us preserve DSCP
+// from the redirected packet onto the upstream-side send so QoS
+// markings survive the forward (mihomo does this; sing-box doesn't).
+// NO explicit SO_RCVBUF: same reason as TCP — kernel autotunes up to
+// net.core.rmem_max, an explicit value caps the autotune ceiling.
 func tproxyUDPControl(network, address string, c syscall.RawConn) error {
 	var setErr error
 	err := c.Control(func(fd uintptr) {
@@ -158,11 +167,9 @@ func tproxyUDPControl(network, address string, c syscall.RawConn) error {
 		}
 		_ = unix.SetsockoptInt(int(fd), unix.IPPROTO_IP, unix.IP_RECVORIGDSTADDR, 1)
 		_ = unix.SetsockoptInt(int(fd), unix.IPPROTO_IPV6, unix.IPV6_RECVORIGDSTADDR, 1)
+		_ = unix.SetsockoptInt(int(fd), unix.IPPROTO_IP, unix.IP_RECVTOS, 1)
+		_ = unix.SetsockoptInt(int(fd), unix.IPPROTO_IPV6, unix.IPV6_RECVTCLASS, 1)
 		_ = unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_REUSEADDR, 1)
-		// 8 MiB recv buffer absorbs bursts from many concurrent flows
-		// while the userspace loop catches up. Without this the kernel
-		// drops on burst overflow at default ~256 KB.
-		_ = unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_RCVBUF, 8<<20)
 	})
 	if err != nil {
 		return err
@@ -170,14 +177,14 @@ func tproxyUDPControl(network, address string, c syscall.RawConn) error {
 	return setErr
 }
 
-// tuneTCP applies the per-flow socket options that turn an ordinary
-// forwarded TCP connection into a high-throughput one: BBR
-// congestion control (kernel default is often cubic, which underruns
-// long fat pipes), 4 MiB send + recv buffers (kernel autotunes but
-// the floor is sometimes too low), TCP_NODELAY (no Nagle delay since
-// we may be carrying interactive bytes), keepalive to drop dead
-// peers. Errors are deliberately swallowed: failing to tune doesn't
-// break the forward; it just leaves performance on the table.
+// tuneTCP mirrors what sing-box does on a forwarded TCP socket:
+// TCP_NODELAY (default in Go anyway), keepalive, and BBR congestion
+// control. NO explicit SO_SNDBUF / SO_RCVBUF — setting those caps
+// Linux's TCP auto-tuning at the requested value instead of letting
+// it grow to net.core.{r,w}mem_max (which on a modern host is
+// 32-64 MiB). NO TCP_USER_TIMEOUT — sing-box doesn't set it and
+// killing connections at 30s of no-ACK can prematurely drop long
+// idle proxied flows.
 func tuneTCP(c net.Conn) {
 	tc, ok := c.(*net.TCPConn)
 	if !ok {
@@ -186,38 +193,24 @@ func tuneTCP(c net.Conn) {
 	_ = tc.SetNoDelay(true)
 	_ = tc.SetKeepAlive(true)
 	_ = tc.SetKeepAlivePeriod(30 * time.Second)
-	sc, err := tc.SyscallConn()
-	if err != nil {
-		return
-	}
-	_ = sc.Control(func(fd uintptr) {
-		// 4 MiB each direction. Linux silently caps at
-		// net.core.{r,w}mem_max, which is 4 MiB on most distros and
-		// boosted to 32 MiB on our bench hosts; setting 4 MiB is a
-		// reasonable floor without needing operator tuning.
-		_ = unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_SNDBUF, 4<<20)
-		_ = unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_RCVBUF, 4<<20)
-		// TCP_USER_TIMEOUT: kill the conn after 30s of no ACK so a
-		// stalled forward doesn't pin resources indefinitely.
-		_ = unix.SetsockoptInt(int(fd), unix.IPPROTO_TCP, unix.TCP_USER_TIMEOUT, 30000)
-	})
 	_ = applyBBR(c)
 }
 
-// tunedTCPDialer returns a *net.Dialer that arms outgoing TCP sockets
-// with BBR and large buffers via the Control hook, so the tuning is
-// in effect from the very first SYN (cwnd ramps faster).
+// tunedTCPDialer mirrors sing-box's outbound dial: KeepAlive on, BBR
+// applied via Control so cwnd ramps under BBR from the first SYN,
+// and TCP_FASTOPEN_CONNECT so the SYN carries the first request bytes
+// (saves one RTT on connection setup; ignored by the kernel if the
+// destination doesn't support TFO).
 func tunedTCPDialer(timeout time.Duration) *net.Dialer {
 	return &net.Dialer{
 		Timeout:   timeout,
 		KeepAlive: 30 * time.Second,
 		Control: func(network, address string, c syscall.RawConn) error {
 			return c.Control(func(fd uintptr) {
-				_ = unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_SNDBUF, 4<<20)
-				_ = unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_RCVBUF, 4<<20)
 				if bbrAvailable() {
 					_ = unix.SetsockoptString(int(fd), unix.IPPROTO_TCP, unix.TCP_CONGESTION, "bbr")
 				}
+				_ = unix.SetsockoptInt(int(fd), unix.IPPROTO_TCP, unix.TCP_FASTOPEN_CONNECT, 1)
 			})
 		},
 	}
@@ -339,6 +332,7 @@ type tproxyUDPFlow struct {
 	reply        *net.UDPConn
 	clientAddr   *net.UDPAddr
 	lastActivity atomic.Int64 // unix-nano of most recent traffic
+	lastDSCP     byte         // last DSCP byte applied to upstream
 	closed       atomic.Bool
 	closeCh      chan struct{}
 	closeOnce    sync.Once
@@ -355,6 +349,13 @@ func (f *tproxyUDPFlow) shutdown() {
 	})
 }
 
+// udpAcceptLoop reads UDP packets from the TPROXY listener in
+// batches via recvmmsg(2) and fans them out to per-flow connected
+// upstream sockets. Batched receive amortises the syscall overhead
+// across up to udpBatchSize packets per call; sing-box uses the
+// same trick. We don't batch the upstream send because each packet
+// in a batch may belong to a different flow (different connected
+// socket), so per-packet Write is the correct shape after fanout.
 func (t *TPROXYListener) udpAcceptLoop(ctx context.Context) {
 	defer t.wg.Done()
 	udpConn, ok := t.udpPC.(*net.UDPConn)
@@ -371,10 +372,7 @@ func (t *TPROXYListener) udpAcceptLoop(ctx context.Context) {
 	flowsMu := sync.Mutex{}
 	flows := map[string]*tproxyUDPFlow{}
 
-	// Pre-allocated buffers for the accept-loop's recv path. The
-	// payload buffer is pooled separately so it can travel with the
-	// per-flow write op without holding the accept-loop hostage.
-	cbuf := make([]byte, 1024)
+	batch := newUDPRxBatch(udpBatchSize)
 	for {
 		select {
 		case <-t.closed:
@@ -383,77 +381,148 @@ func (t *TPROXYListener) udpAcceptLoop(ctx context.Context) {
 		}
 		_ = udpConn.SetReadDeadline(time.Now().Add(1 * time.Second))
 
-		bufPtr := udpBufPool.Get().(*[]byte)
-		buf := *bufPtr
-		var n, oobn int
-		var srcSA unix.Sockaddr
-		var rerr error
+		batch.arm()
+		var n int
+		var errno syscall.Errno
 		cerr := sc.Read(func(fd uintptr) bool {
-			n, oobn, _, srcSA, rerr = unix.Recvmsg(int(fd), buf, cbuf, 0)
-			return !errors.Is(rerr, unix.EAGAIN) && !errors.Is(rerr, unix.EWOULDBLOCK)
+			n, errno = recvmmsg(int(fd), batch.msgs, 0)
+			return !errors.Is(errno, unix.EAGAIN) && !errors.Is(errno, unix.EWOULDBLOCK)
 		})
 		if cerr != nil {
-			rerr = cerr
-		}
-		if rerr != nil {
-			udpBufPool.Put(bufPtr)
 			select {
 			case <-t.closed:
 				return
 			default:
 			}
-			if errors.Is(rerr, net.ErrClosed) {
+			if errors.Is(cerr, net.ErrClosed) {
 				return
 			}
 			var ne net.Error
-			if errors.As(rerr, &ne) && ne.Timeout() {
-				continue
-			}
-			if errors.Is(rerr, unix.EAGAIN) {
+			if errors.As(cerr, &ne) && ne.Timeout() {
 				continue
 			}
 			continue
 		}
-		if n <= 0 {
-			udpBufPool.Put(bufPtr)
+		if errno != 0 {
+			if errno == unix.EAGAIN || errno == unix.EWOULDBLOCK {
+				continue
+			}
 			continue
 		}
-		src := sockaddrToAddrPort(srcSA)
-		dst, dstOK := origDstFromCmsg(cbuf[:oobn])
-		if !dstOK {
-			udpBufPool.Put(bufPtr)
-			continue
-		}
-		if t.cfg.EnforceIsolation && t.inPool(dst.Addr()) {
-			udpBufPool.Put(bufPtr)
-			continue
-		}
-		key := src.String() + "|" + dst.String()
+		for i := 0; i < n; i++ {
+			msg := &batch.msgs[i]
+			payloadLen := int(msg.Len)
+			if payloadLen <= 0 {
+				continue
+			}
+			src := rawSockaddrToAddrPort(&batch.names[i])
+			dst, dscp, dstOK := parsePerPacketCmsg(batch.cbufs[i][:msg.Hdr.Controllen])
+			if !dstOK {
+				continue
+			}
+			if t.cfg.EnforceIsolation && t.inPool(dst.Addr()) {
+				continue
+			}
+			key := src.String() + "|" + dst.String()
 
-		flowsMu.Lock()
-		flow, exists := flows[key]
-		if !exists {
-			f, err := t.openUDPFlow(ctx, src, dst)
-			if err != nil {
-				flowsMu.Unlock()
-				udpBufPool.Put(bufPtr)
-				continue
+			flowsMu.Lock()
+			flow, exists := flows[key]
+			if !exists {
+				f, err := t.openUDPFlow(ctx, src, dst)
+				if err != nil {
+					flowsMu.Unlock()
+					continue
+				}
+				flow = f
+				flows[key] = f
+				t.wg.Add(1)
+				go t.runUDPReplyPump(ctx, f, &flowsMu, flows, key)
 			}
-			flow = f
-			flows[key] = f
-			t.wg.Add(1)
-			go t.runUDPReplyPump(ctx, f, &flowsMu, flows, key)
-		}
-		flow.bump()
-		flowsMu.Unlock()
+			flow.bump()
+			flowsMu.Unlock()
 
-		// Connected upstream socket: kernel knows where these bytes
-		// are going, no per-packet route lookup. Direct write from
-		// the accept loop avoids the channel hop and the second
-		// allocation we used to do.
-		_, _ = flow.upstream.Write(buf[:n])
-		udpBufPool.Put(bufPtr)
+			// DSCP propagation: if the inbound packet carried a non-
+			// zero DSCP marking and it differs from what the upstream
+			// socket currently has, update it before write. Cached on
+			// the flow so we don't setsockopt every packet.
+			if dscp != 0 && dscp != flow.lastDSCP {
+				applyDSCP(flow.upstream, dst.Addr().Is6(), dscp)
+				flow.lastDSCP = dscp
+			}
+			_, _ = flow.upstream.Write(batch.bufs[i][:payloadLen])
+		}
 	}
+}
+
+// parsePerPacketCmsg extracts both the original-destination address
+// and the DSCP byte (IP_TOS / IPV6_TCLASS) from a single packet's
+// control-message buffer. Reuses the cmsg walker; one pass.
+func parsePerPacketCmsg(cbuf []byte) (dst netip.AddrPort, dscp byte, ok bool) {
+	msgs, err := unix.ParseSocketControlMessage(cbuf)
+	if err != nil {
+		return netip.AddrPort{}, 0, false
+	}
+	for _, m := range msgs {
+		switch {
+		case m.Header.Level == unix.IPPROTO_IP && m.Header.Type == unix.IP_ORIGDSTADDR && len(m.Data) >= 8:
+			port := binary.BigEndian.Uint16(m.Data[2:4])
+			var v4 [4]byte
+			copy(v4[:], m.Data[4:8])
+			dst = netip.AddrPortFrom(netip.AddrFrom4(v4), port)
+			ok = true
+		case m.Header.Level == unix.IPPROTO_IPV6 && m.Header.Type == unix.IPV6_ORIGDSTADDR && len(m.Data) >= 24:
+			port := binary.BigEndian.Uint16(m.Data[2:4])
+			var v6 [16]byte
+			copy(v6[:], m.Data[8:24])
+			dst = netip.AddrPortFrom(netip.AddrFrom16(v6), port)
+			ok = true
+		case m.Header.Level == unix.IPPROTO_IP && m.Header.Type == unix.IP_TOS && len(m.Data) >= 1:
+			dscp = m.Data[0]
+		case m.Header.Level == unix.IPPROTO_IPV6 && m.Header.Type == unix.IPV6_TCLASS && len(m.Data) >= 4:
+			// IPV6_TCLASS comes as a 4-byte int; the TOS byte is the
+			// low octet on little-endian kernels.
+			dscp = m.Data[0]
+		}
+	}
+	return
+}
+
+// rawSockaddrToAddrPort converts the kernel's RawSockaddrAny (the
+// name field of a Msghdr) into a netip.AddrPort. Handles both v4 and
+// v4-mapped-v6 (since our TPROXY socket is dual-stack and v4 packets
+// arrive with ::ffff:a.b.c.d sockaddrs).
+func rawSockaddrToAddrPort(sa *unix.RawSockaddrAny) netip.AddrPort {
+	switch sa.Addr.Family {
+	case unix.AF_INET:
+		p := (*unix.RawSockaddrInet4)(unsafe.Pointer(sa))
+		return netip.AddrPortFrom(netip.AddrFrom4(p.Addr), uint16(p.Port>>8|p.Port<<8))
+	case unix.AF_INET6:
+		p := (*unix.RawSockaddrInet6)(unsafe.Pointer(sa))
+		addr := netip.AddrFrom16(p.Addr)
+		if v4 := addr.As4(); addr.Is4In6() {
+			addr = netip.AddrFrom4(v4)
+		}
+		return netip.AddrPortFrom(addr, uint16(p.Port>>8|p.Port<<8))
+	}
+	return netip.AddrPort{}
+}
+
+// applyDSCP sets IP_TOS (v4) or IPV6_TCLASS (v6) on the given UDP
+// conn, preserving the DSCP marking from an inbound packet onto
+// subsequent outbound packets on this socket. Caller should cache
+// the value and avoid setsockopt'ing the same byte twice.
+func applyDSCP(conn *net.UDPConn, isV6 bool, dscp byte) {
+	sc, err := conn.SyscallConn()
+	if err != nil {
+		return
+	}
+	_ = sc.Control(func(fd uintptr) {
+		if isV6 {
+			_ = unix.SetsockoptInt(int(fd), unix.IPPROTO_IPV6, unix.IPV6_TCLASS, int(dscp))
+		} else {
+			_ = unix.SetsockoptInt(int(fd), unix.IPPROTO_IP, unix.IP_TOS, int(dscp))
+		}
+	})
 }
 
 // openUDPFlow allocates a per-flow connected upstream socket and a
@@ -565,40 +634,3 @@ func (t *TPROXYListener) runUDPReplyPump(ctx context.Context, f *tproxyUDPFlow, 
 	}
 }
 
-func sockaddrToAddrPort(sa unix.Sockaddr) netip.AddrPort {
-	switch a := sa.(type) {
-	case *unix.SockaddrInet4:
-		return netip.AddrPortFrom(netip.AddrFrom4(a.Addr), uint16(a.Port))
-	case *unix.SockaddrInet6:
-		return netip.AddrPortFrom(netip.AddrFrom16(a.Addr), uint16(a.Port))
-	}
-	return netip.AddrPort{}
-}
-
-func origDstFromCmsg(cbuf []byte) (netip.AddrPort, bool) {
-	msgs, err := unix.ParseSocketControlMessage(cbuf)
-	if err != nil {
-		return netip.AddrPort{}, false
-	}
-	for _, m := range msgs {
-		if m.Header.Level == unix.IPPROTO_IP && m.Header.Type == unix.IP_ORIGDSTADDR {
-			if len(m.Data) < 8 {
-				continue
-			}
-			port := binary.BigEndian.Uint16(m.Data[2:4])
-			var v4 [4]byte
-			copy(v4[:], m.Data[4:8])
-			return netip.AddrPortFrom(netip.AddrFrom4(v4), port), true
-		}
-		if m.Header.Level == unix.IPPROTO_IPV6 && m.Header.Type == unix.IPV6_ORIGDSTADDR {
-			if len(m.Data) < 24 {
-				continue
-			}
-			port := binary.BigEndian.Uint16(m.Data[2:4])
-			var v6 [16]byte
-			copy(v6[:], m.Data[8:24])
-			return netip.AddrPortFrom(netip.AddrFrom16(v6), port), true
-		}
-	}
-	return netip.AddrPort{}, false
-}
