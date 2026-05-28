@@ -7,6 +7,8 @@ import (
 	"net"
 	"net/netip"
 	"time"
+
+	"github.com/flynn/noise"
 )
 
 const (
@@ -66,7 +68,17 @@ func runSupervised(ctx context.Context, id int, pio PacketIO, src connSource, ex
 			continue
 		}
 		backoff = backoffInitial
-		logger.Printf("lane %d: up peer=%s cipher=%s", id, c.RemoteAddr(), ident.keys.kind)
+		// Enable UDP segmentation offload now that the handshake confirmed
+		// the peer supports it; this lets the kernel coalesce same-flow UDP
+		// like it does TCP. No-op for backends that cannot toggle it.
+		if ident.usoEnabled {
+			if u, ok := pio.(usoController); ok {
+				if err := u.SetUSO(true); err != nil {
+					logger.Printf("lane %d: enable USO: %v", id, err)
+				}
+			}
+		}
+		logger.Printf("lane %d: up peer=%s encrypted=%v uso=%v", id, c.RemoteAddr(), ident.keys.encrypted, ident.usoEnabled)
 
 		if !notified && onAssign != nil && ident.hasAssignment() {
 			onAssign(Assignment{
@@ -118,17 +130,26 @@ func sleepJitter(ctx context.Context, d time.Duration) bool {
 }
 
 // clientSource returns a connSource that dials peer over dialer and runs the
-// initiate-side handshake. clientID identifies this client; laneCount is the
-// total lanes this client will open (informational on server side). userName
-// is the on-wire identity used to select the matching PSK on the server.
-// reqIP is the IP the client prefers to be assigned (zero = any).
-func clientSource(peer string, psk []byte, cipher Cipher, dialer ContextDialer, userName string, clientID [clientIDLen]byte, laneCount byte, req AssignmentRequest) connSource {
+// initiate-side handshake. privKey is the client's static private key and
+// serverPub is the server's static public key (empty serverPub selects open
+// mode). laneCount is the total lanes this client will open (informational on
+// the server side); req carries the addresses the client prefers (zero = any).
+func clientSource(peer string, privKey, serverPub []byte, cipher Cipher, localUSO bool, dialer ContextDialer, laneCount byte, req AssignmentRequest) connSource {
 	return func(ctx context.Context) (net.Conn, laneIdentity, error) {
 		c, err := dialer.DialContext(ctx, "tcp", peer)
 		if err != nil {
 			return nil, laneIdentity{}, err
 		}
-		ident, err := initiateHandshake(c, psk, cipher, userName, clientID, laneCount, req)
+		if len(serverPub) == 0 {
+			// Open mode: no handshake, no encryption.
+			return c, laneIdentity{laneCount: laneCount}, nil
+		}
+		static, err := noiseStatic(privKey)
+		if err != nil {
+			c.Close()
+			return nil, laneIdentity{}, err
+		}
+		ident, err := initiateHandshake(c, static, serverPub, cipher, localUSO, laneCount, req)
 		if err != nil {
 			c.Close()
 			return nil, laneIdentity{}, err
@@ -164,7 +185,7 @@ func (p *serverPool) source() connSource {
 	}
 }
 
-func runAcceptLoop(ctx context.Context, ln net.Listener, allow string, resolve pskResolver, pool *serverPool, logger *log.Logger) {
+func runAcceptLoop(ctx context.Context, ln net.Listener, allow string, static noise.DHKey, cipher Cipher, localUSO bool, authorize pubKeyAuthorizer, pool *serverPool, limiter *connLimiter, metrics *Metrics, logger *log.Logger) {
 	for {
 		c, err := ln.Accept()
 		if err != nil {
@@ -177,15 +198,21 @@ func runAcceptLoop(ctx context.Context, ln net.Listener, allow string, resolve p
 			}
 			continue
 		}
-		if allow != "" {
-			if ip := remoteIP(c); ip != allow {
-				logger.Printf("reject %s (allow=%s)", ip, allow)
-				c.Close()
-				continue
-			}
+		metrics.incAccept()
+		ip := remoteIP(c)
+		if allow != "" && ip != allow {
+			logger.Printf("reject %s (allow=%s)", ip, allow)
+			c.Close()
+			continue
 		}
-		if resolve == nil {
-			// No PSK configured: bypass the handshake entirely.
+		if !limiter.allowIP(ip) {
+			metrics.incRateLimited()
+			logger.Printf("rate-limited %s", ip)
+			c.Close()
+			continue
+		}
+		if authorize == nil {
+			// Open mode: no keys configured, bypass the handshake.
 			select {
 			case pool.ready <- acceptedConn{c, laneIdentity{}}:
 			case <-ctx.Done():
@@ -194,12 +221,14 @@ func runAcceptLoop(ctx context.Context, ln net.Listener, allow string, resolve p
 			}
 			continue
 		}
-		ident, err := acceptHandshake(c, resolve, nil)
+		ident, err := acceptHandshake(c, static, cipher, localUSO, authorize, nil)
 		if err != nil {
+			metrics.incHandshakeFail()
 			logger.Printf("handshake fail from %s: %v", c.RemoteAddr(), err)
 			c.Close()
 			continue
 		}
+		metrics.incHandshakeOK()
 		select {
 		case pool.ready <- acceptedConn{c, ident}:
 		case <-ctx.Done():

@@ -5,26 +5,29 @@ import (
 	"testing"
 )
 
+// testPub returns a distinct 32-byte public key for tests, tagged by id.
+func testPub(id byte) []byte {
+	k := bytesPattern(pubKeyLen)
+	k[0] = id
+	return k
+}
+
 func TestUserDBLookupAndQuota(t *testing.T) {
+	alicePub := testPub(0xaa)
+	bobPub := testPub(0xbb)
 	users := []User{
-		{Name: "alice", PSK: make([]byte, 16), MaxConcurrent: 2},
-		{Name: "bob", PSK: make([]byte, 32), MaxConcurrent: 0},
-	}
-	for i := range users[0].PSK {
-		users[0].PSK[i] = byte(i)
-	}
-	for i := range users[1].PSK {
-		users[1].PSK[i] = byte(0xff - i)
+		{Name: "alice", PublicKey: alicePub, MaxConcurrent: 2},
+		{Name: "bob", PublicKey: bobPub, MaxConcurrent: 0},
 	}
 	db, err := NewUserDB(users)
 	if err != nil {
 		t.Fatalf("NewUserDB: %v", err)
 	}
-	if u := db.Lookup(encodeUserName("alice")); u == nil || u.Name != "alice" {
+	if u := db.LookupByKey(alicePub); u == nil || u.Name != "alice" {
 		t.Fatalf("alice lookup failed: %#v", u)
 	}
-	if u := db.Lookup(encodeUserName("nope")); u != nil {
-		t.Fatalf("expected nil for unknown user, got %#v", u)
+	if u := db.LookupByKey(testPub(0x99)); u != nil {
+		t.Fatalf("expected nil for unknown key, got %#v", u)
 	}
 	if err := db.AcquireSlot("alice"); err != nil {
 		t.Fatalf("acquire 1: %v", err)
@@ -47,11 +50,21 @@ func TestUserDBLookupAndQuota(t *testing.T) {
 func TestUserDBReservationConflict(t *testing.T) {
 	a := netip.MustParseAddr("10.66.0.5")
 	users := []User{
-		{Name: "alice", PSK: make([]byte, 16), Reserved: []netip.Addr{a}},
-		{Name: "bob", PSK: make([]byte, 16), Reserved: []netip.Addr{a}},
+		{Name: "alice", PublicKey: testPub(0xaa), Reserved: []netip.Addr{a}},
+		{Name: "bob", PublicKey: testPub(0xbb), Reserved: []netip.Addr{a}},
 	}
 	if _, err := NewUserDB(users); err == nil {
 		t.Fatalf("expected reservation conflict error")
+	}
+}
+
+func TestUserDBDuplicateKey(t *testing.T) {
+	users := []User{
+		{Name: "alice", PublicKey: testPub(0xaa)},
+		{Name: "bob", PublicKey: testPub(0xaa)},
+	}
+	if _, err := NewUserDB(users); err == nil {
+		t.Fatalf("expected duplicate public key error")
 	}
 }
 
@@ -59,8 +72,8 @@ func TestIPPoolReservedForOwner(t *testing.T) {
 	subnet := netip.MustParsePrefix("10.66.0.0/24")
 	reserved := netip.MustParseAddr("10.66.0.5")
 	users := []User{
-		{Name: "alice", PSK: make([]byte, 16), Reserved: []netip.Addr{reserved}},
-		{Name: "bob", PSK: make([]byte, 16)},
+		{Name: "alice", PublicKey: testPub(0xaa), Reserved: []netip.Addr{reserved}},
+		{Name: "bob", PublicKey: testPub(0xbb)},
 	}
 	db, err := NewUserDB(users)
 	if err != nil {

@@ -17,21 +17,34 @@ import (
 // everything. Fields left zero in the YAML keep their CLI-supplied
 // or built-in default.
 type FileConfig struct {
-	Listen    string         `yaml:"listen"`
-	Lanes     int            `yaml:"lanes"`
-	MPTCP     bool           `yaml:"mptcp"`
-	Cipher    string         `yaml:"cipher"`
-	BBR       *bool          `yaml:"bbr"`
-	VnetHdr   *bool          `yaml:"vnet_hdr"`
-	AllowIP   string         `yaml:"allow_ip"`
-	TUNName   string         `yaml:"tun_name"`
-	ServerPSK string         `yaml:"server_psk"`
-	Brutal    BrutalConfig   `yaml:"brutal"`
-	Pool      PoolConfig     `yaml:"pool"`
-	Users     []UserFile     `yaml:"users"`
-	Forward   ForwardConfig  `yaml:"forward"`
-	NFT       NFTFileConfig  `yaml:"nft"`
-	TPROXY    TPROXYFileConf `yaml:"tproxy"`
+	Listen     string         `yaml:"listen"`
+	Lanes      int            `yaml:"lanes"`
+	MPTCP      bool           `yaml:"mptcp"`
+	Cipher     string         `yaml:"cipher"`
+	BBR        *bool          `yaml:"bbr"`
+	VnetHdr    *bool          `yaml:"vnet_hdr"`
+	AllowIP    string         `yaml:"allow_ip"`
+	TUNName    string         `yaml:"tun_name"`
+	ServerKey  string         `yaml:"server_private_key"`
+	PeerPubKey string         `yaml:"peer_public_key"`
+	Brutal     BrutalConfig   `yaml:"brutal"`
+	Pool       PoolConfig     `yaml:"pool"`
+	Users      []UserFile     `yaml:"users"`
+	RateLimit  RateLimitFile  `yaml:"rate_limit"`
+	Forward    ForwardConfig  `yaml:"forward"`
+	NFT        NFTFileConfig  `yaml:"nft"`
+	TPROXY     TPROXYFileConf `yaml:"tproxy"`
+}
+
+// RateLimitFile is the YAML form of the accept-path abuse controls.
+// Omitted fields keep the built-in defaults; set disabled: true to turn
+// the limiter off entirely.
+type RateLimitFile struct {
+	Disabled     bool    `yaml:"disabled"`
+	PerIPPerSec  float64 `yaml:"per_ip_per_sec"`
+	PerIPBurst   int     `yaml:"per_ip_burst"`
+	MaxInFlight  int     `yaml:"max_in_flight"`
+	MaxIPEntries int     `yaml:"max_ip_entries"`
 }
 
 // BrutalConfig configures the tcp-brutal congestion control wrapper.
@@ -51,7 +64,7 @@ type PoolConfig struct {
 // UserFile is the YAML form of a User entry.
 type UserFile struct {
 	Name          string   `yaml:"name"`
-	PSKHex        string   `yaml:"psk_hex"`
+	PublicKey     string   `yaml:"public_key"`
 	MaxConcurrent int      `yaml:"max_concurrent"`
 	Reserved      []string `yaml:"reserved"`
 }
@@ -63,6 +76,7 @@ type ForwardConfig struct {
 	Isolation        bool   `yaml:"isolation"`
 	Masquerade       bool   `yaml:"masquerade"`
 	TPROXY           bool   `yaml:"tproxy"`
+	Metering         bool   `yaml:"metering"`
 	TPROXYListenPort int    `yaml:"tproxy_listen_port"`
 	TPROXYFwmark     uint32 `yaml:"tproxy_fwmark"`
 	TPROXYTable      uint32 `yaml:"tproxy_table"`
@@ -81,12 +95,12 @@ type NFTFileConfig struct {
 // TPROXYFileConf groups the TPROXY listener tunables that live
 // alongside the nft rules.
 type TPROXYFileConf struct {
-	Enabled      *bool  `yaml:"enabled"`
-	ListenAddr   string `yaml:"listen_addr"`
-	ListenPort   int    `yaml:"listen_port"`
-	Family       string `yaml:"family"`
-	UDPIdleSecs  int    `yaml:"udp_idle_secs"`
-	EnforceIso   *bool  `yaml:"enforce_isolation"`
+	Enabled     *bool  `yaml:"enabled"`
+	ListenAddr  string `yaml:"listen_addr"`
+	ListenPort  int    `yaml:"listen_port"`
+	Family      string `yaml:"family"`
+	UDPIdleSecs int    `yaml:"udp_idle_secs"`
+	EnforceIso  *bool  `yaml:"enforce_isolation"`
 }
 
 // LoadFile parses a YAML file. An empty path returns an empty
@@ -113,12 +127,12 @@ func LoadFile(path string) (FileConfig, error) {
 func (fc FileConfig) ToUsers() ([]User, error) {
 	out := make([]User, 0, len(fc.Users))
 	for i, u := range fc.Users {
-		psk, err := ParsePSKHex(u.PSKHex)
+		pub, err := ParseKey(u.PublicKey)
 		if err != nil {
 			return nil, fmt.Errorf("user %d (%q): %w", i, u.Name, err)
 		}
-		if len(psk) == 0 {
-			return nil, fmt.Errorf("user %d (%q): psk_hex is required", i, u.Name)
+		if len(pub) == 0 {
+			return nil, fmt.Errorf("user %d (%q): public_key is required", i, u.Name)
 		}
 		var reserved []netip.Addr
 		for _, s := range u.Reserved {
@@ -130,7 +144,7 @@ func (fc FileConfig) ToUsers() ([]User, error) {
 		}
 		out = append(out, User{
 			Name:          u.Name,
-			PSK:           psk,
+			PublicKey:     pub,
 			MaxConcurrent: u.MaxConcurrent,
 			Reserved:      reserved,
 		})
@@ -165,12 +179,33 @@ func (fc FileConfig) ApplyServer(cfg *ServerConfig) error {
 	if fc.VnetHdr != nil {
 		cfg.VnetHdr = *fc.VnetHdr
 	}
-	if len(cfg.PSK) == 0 && fc.ServerPSK != "" {
-		psk, err := ParsePSKHex(fc.ServerPSK)
+	if len(cfg.StaticPrivateKey) == 0 && fc.ServerKey != "" {
+		k, err := ParseKey(fc.ServerKey)
+		if err != nil {
+			return fmt.Errorf("server_private_key: %w", err)
+		}
+		cfg.StaticPrivateKey = k
+	}
+	if len(cfg.PeerPublicKey) == 0 && fc.PeerPubKey != "" {
+		k, err := ParseKey(fc.PeerPubKey)
+		if err != nil {
+			return fmt.Errorf("peer_public_key: %w", err)
+		}
+		cfg.PeerPublicKey = k
+	}
+	if cfg.Cipher == CipherNone {
+		ciph, err := fc.CipherChoice()
 		if err != nil {
 			return err
 		}
-		cfg.PSK = psk
+		cfg.Cipher = ciph
+	}
+	cfg.RateLimit = RateLimitConfig{
+		Disabled:     fc.RateLimit.Disabled,
+		PerIPPerSec:  fc.RateLimit.PerIPPerSec,
+		PerIPBurst:   fc.RateLimit.PerIPBurst,
+		MaxInFlight:  fc.RateLimit.MaxInFlight,
+		MaxIPEntries: fc.RateLimit.MaxIPEntries,
 	}
 	if fc.Pool.V4Subnet != "" {
 		p, err := netip.ParsePrefix(fc.Pool.V4Subnet)
@@ -221,7 +256,7 @@ func (fc FileConfig) applyForward(cfg *ServerConfig) error {
 	// nft installer mirrors the forward posture. Default Enabled is
 	// driven by whether any forward feature is requested; the
 	// optional NFTFileConfig.Enabled override wins when set.
-	nftWanted := fwd.Isolation || fwd.Masquerade || fwd.TPROXY
+	nftWanted := fwd.Isolation || fwd.Masquerade || fwd.TPROXY || fwd.Metering
 	enabled := nftWanted
 	if fc.NFT.Enabled != nil {
 		enabled = *fc.NFT.Enabled
@@ -242,6 +277,9 @@ func (fc FileConfig) applyForward(cfg *ServerConfig) error {
 		IPv6:            cfg.Subnet6.IsValid(),
 		ServerIP4:       cfg.ServerIP,
 		ServerIP6:       cfg.ServerIP6,
+		Accounting:      fwd.Metering,
+		PoolV4:          cfg.Subnet,
+		PoolV6:          cfg.Subnet6,
 	}
 
 	// TPROXY listener: enabled by default when forward.tproxy is on.

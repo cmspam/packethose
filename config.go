@@ -14,15 +14,19 @@ import (
 type Cipher byte
 
 const (
-	// CipherNone disables encryption. Handshake (if PSK is set) still
-	// authenticates the connection.
+	// CipherNone is the zero value. In keyed mode the suite defaults to
+	// AES-128-GCM; CipherNone as a transport selection means open mode only.
 	CipherNone Cipher = 0
-	// CipherAESGCM is AES-128 in GCM mode. Hardware-accelerated on every
-	// modern x86/ARM CPU; preferred default.
+	// CipherAESGCM is AES-128-GCM. Hardware-accelerated on every modern
+	// x86/ARM CPU and the fastest option; the default.
 	CipherAESGCM Cipher = 1
 	// CipherChaCha is ChaCha20-Poly1305. Fallback for hardware without AES
 	// instructions.
 	CipherChaCha Cipher = 2
+	// CipherAES256GCM is AES-256-GCM, for deployments that require a
+	// 256-bit data key. Slower than AES-128 (more rounds) but still
+	// hardware-accelerated.
+	CipherAES256GCM Cipher = 3
 )
 
 func (c Cipher) String() string {
@@ -30,25 +34,31 @@ func (c Cipher) String() string {
 	case CipherNone:
 		return "none"
 	case CipherAESGCM:
-		return "aes-gcm"
+		return "aes-128-gcm"
 	case CipherChaCha:
 		return "chacha20"
+	case CipherAES256GCM:
+		return "aes-256-gcm"
 	}
 	return fmt.Sprintf("unknown(%d)", byte(c))
 }
 
-// ParseCipher parses a cipher name. Accepts "none", "aes-gcm" (or "aes"),
-// "chacha20" (or "chacha20-poly1305"), or the empty string (same as "none").
+// ParseCipher parses a cipher name. "aes-gcm"/"aes"/"aes-128-gcm" select
+// AES-128-GCM (the default); "aes-256-gcm" selects AES-256-GCM;
+// "chacha20"/"chacha20-poly1305" select ChaCha20-Poly1305; "" / "none"
+// is open mode.
 func ParseCipher(s string) (Cipher, error) {
 	switch s {
 	case "", "none":
 		return CipherNone, nil
-	case "aes-gcm", "aes":
+	case "aes-gcm", "aes", "aes-128-gcm", "aes-128":
 		return CipherAESGCM, nil
+	case "aes-256-gcm", "aes-256":
+		return CipherAES256GCM, nil
 	case "chacha20", "chacha20-poly1305":
 		return CipherChaCha, nil
 	}
-	return CipherNone, fmt.Errorf("unknown cipher %q (want none|aes-gcm|chacha20)", s)
+	return CipherNone, fmt.Errorf("unknown cipher %q (want none|aes-128-gcm|aes-256-gcm|chacha20)", s)
 }
 
 // ContextDialer is the minimal dialer interface packethose needs for outer
@@ -68,13 +78,16 @@ type ClientConfig struct {
 	// kernel-TUN-backed set, or supply your own.
 	Queues []PacketIO
 
-	// PSK enables the HMAC-based handshake. Required when Cipher != none.
-	PSK []byte
-	// UserName is sent in the handshake so a multi-user server can
-	// select the matching PSK in one lookup. Empty signals a
-	// legacy single-PSK server.
-	UserName string
-	// Cipher selects the AEAD for payload protection.
+	// StaticPrivateKey is this client's 32-byte X25519 static private
+	// key (its identity). Empty selects open mode: no handshake, no
+	// encryption.
+	StaticPrivateKey []byte
+	// PeerPublicKey is the server's 32-byte X25519 static public key,
+	// known in advance (the Noise IK pre-message) and also the source of
+	// the obfuscation-envelope key. Required when StaticPrivateKey is set.
+	PeerPublicKey []byte
+	// Cipher selects the AEAD suite for the Noise handshake and
+	// transport. Must match the server's configured suite.
 	Cipher Cipher
 	// MPTCP enables Multipath TCP on the outer sockets.
 	MPTCP bool
@@ -88,12 +101,6 @@ type ClientConfig struct {
 	// the built-in tuning (NoDelay, keepalive, SO_*BUF). Use this hook to
 	// install custom socket options like tcp-brutal (see SetBrutalRate).
 	TuneSocket func(net.Conn)
-
-	// ClientID is the 16-byte identifier sent on every lane's handshake.
-	// When the server is in multi-client mode it groups lanes by this ID
-	// and assigns addresses per ID. Zero = NewClient generates a random
-	// one.
-	ClientID [clientIDLen]byte
 
 	// RequestIP and RequestIP6, if set, are the IPv4 and/or IPv6 addresses
 	// the client would prefer to be assigned. The server may honor them
@@ -120,17 +127,31 @@ type ServerConfig struct {
 	Lanes  int
 	Queues []PacketIO
 
-	// PSK enables the handshake when no Users are configured (single
-	// shared PSK fallback). Required when clients connect with
-	// encryption set unless Users is populated.
-	PSK []byte
-	// Users, when non-empty, switches the server into per-user
-	// identity mode. Each connecting client must name a configured
-	// user in the handshake; the matching PSK is verified.
+	// StaticPrivateKey is the server's 32-byte X25519 static private key
+	// (its identity). Its public half is published to clients and also
+	// keys the obfuscation envelope. Empty selects open mode: no
+	// handshake, no encryption.
+	StaticPrivateKey []byte
+	// PeerPublicKey, when set, is the single authorized client static
+	// public key (single-peer mode). Ignored when Users is populated.
+	PeerPublicKey []byte
+	// Users, when non-empty, switches the server into multi-client
+	// identity mode: each connecting client is authorized by its static
+	// public key against this list.
 	Users []User
+	// Cipher selects the AEAD suite for the Noise handshake and
+	// transport. Clients must be configured with the same suite.
+	Cipher Cipher
 	// AllowIP, if non-empty, restricts accepted connections to this source
 	// IP. The check happens before the handshake.
 	AllowIP string
+	// MetricsAddr, when non-empty, is the addr:port for a read-only HTTP
+	// server exposing Prometheus /metrics and /healthz. Off by default.
+	MetricsAddr string
+	// RateLimit tunes the accept-path abuse controls (per-source-IP
+	// connection rate and a server-wide in-flight-handshake cap). The
+	// zero value is a sensible default posture.
+	RateLimit RateLimitConfig
 	// MPTCP enables Multipath TCP on the listener.
 	MPTCP bool
 
@@ -224,6 +245,13 @@ type TPROXYConfig struct {
 	ServerIP6 netip.Addr
 }
 
+// keyed reports whether the client runs an authenticated, encrypted
+// session (a static keypair is configured) versus open plaintext mode.
+func (c ClientConfig) keyed() bool { return len(c.StaticPrivateKey) > 0 }
+
+// keyed reports whether the server runs authenticated sessions.
+func (c ServerConfig) keyed() bool { return len(c.StaticPrivateKey) > 0 }
+
 // Validate returns nil if the config is internally consistent.
 func (c ClientConfig) Validate() error {
 	if c.Peer == "" {
@@ -235,8 +263,15 @@ func (c ClientConfig) Validate() error {
 	if len(c.Queues) != c.Lanes {
 		return fmt.Errorf("packethose client: Queues has %d entries, expected Lanes=%d", len(c.Queues), c.Lanes)
 	}
-	if c.Cipher != CipherNone && len(c.PSK) == 0 {
-		return errors.New("packethose client: PSK required when Cipher is set")
+	if len(c.StaticPrivateKey) > 0 {
+		if len(c.StaticPrivateKey) != pubKeyLen {
+			return fmt.Errorf("packethose client: StaticPrivateKey must be %d bytes", pubKeyLen)
+		}
+		if len(c.PeerPublicKey) != pubKeyLen {
+			return errors.New("packethose client: PeerPublicKey (server public key) required with StaticPrivateKey")
+		}
+	} else if len(c.PeerPublicKey) > 0 {
+		return errors.New("packethose client: PeerPublicKey set without StaticPrivateKey")
 	}
 	return nil
 }
@@ -246,10 +281,13 @@ func (c ServerConfig) Validate() error {
 	if c.Listen == "" {
 		return errors.New("packethose server: Listen is required")
 	}
-	hasAuth := len(c.PSK) > 0 || len(c.Users) > 0
+	if len(c.StaticPrivateKey) > 0 && len(c.StaticPrivateKey) != pubKeyLen {
+		return fmt.Errorf("packethose server: StaticPrivateKey must be %d bytes", pubKeyLen)
+	}
+	hasAuth := len(c.PeerPublicKey) > 0 || len(c.Users) > 0
 	if c.Subnet.IsValid() || c.Subnet6.IsValid() {
-		if !hasAuth {
-			return errors.New("packethose server: multi-client mode requires PSK or Users")
+		if !c.keyed() || !hasAuth {
+			return errors.New("packethose server: multi-client mode requires a server static key and at least one authorized client key (peer or users)")
 		}
 		if c.Subnet.IsValid() {
 			if !c.ServerIP.IsValid() || !c.ServerIP.Is4() {

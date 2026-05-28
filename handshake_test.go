@@ -1,137 +1,202 @@
 package packethose
 
 import (
+	"bytes"
 	"net"
 	"net/netip"
 	"testing"
 	"time"
 )
 
-// TestHandshakeRoundtripLegacy exercises the v5 handshake using the
-// single-PSK fallback path (no users configured, client sends empty
-// username).
-func TestHandshakeRoundtripLegacy(t *testing.T) {
-	psk := bytesPattern(32)
+type hsResult struct {
+	id  laneIdentity
+	err error
+}
+
+func genKeyT(t *testing.T) (priv, pub []byte) {
+	t.Helper()
+	priv, pub, err := GenerateKeypair()
+	if err != nil {
+		t.Fatalf("GenerateKeypair: %v", err)
+	}
+	return priv, pub
+}
+
+// runHandshake drives a full v7 Noise IK handshake over net.Pipe and
+// returns both sides' identities.
+func runHandshake(t *testing.T, serverPriv, clientPriv []byte, authorize pubKeyAuthorizer, assign acceptAssignFunc, cipher Cipher, req AssignmentRequest) (cli, srv laneIdentity) {
+	t.Helper()
 	a, b := net.Pipe()
-	defer a.Close()
-	defer b.Close()
 	t.Cleanup(func() { a.Close(); b.Close() })
 
-	var clientID [clientIDLen]byte
-	for i := range clientID {
-		clientID[i] = byte(i)
+	serverStatic, err := noiseStatic(serverPriv)
+	if err != nil {
+		t.Fatalf("server static: %v", err)
 	}
-	req := AssignmentRequest{V4: netip.MustParseAddr("10.66.0.10")}
+	clientStatic, err := noiseStatic(clientPriv)
+	if err != nil {
+		t.Fatalf("client static: %v", err)
+	}
 
-	serverDone := make(chan error, 1)
+	sc := make(chan hsResult, 1)
 	go func() {
-		assign := func(name string, id [clientIDLen]byte, r AssignmentRequest) (AssignmentResponse, error) {
-			return AssignmentResponse{
-				V4Addr:   netip.MustParseAddr("10.66.0.10"),
-				V4Prefix: 24,
-				V4Peer:   netip.MustParseAddr("10.66.0.1"),
-			}, nil
-		}
-		_, err := acceptHandshake(b, singlePSKResolver(psk), assign)
-		serverDone <- err
+		id, err := acceptHandshake(b, serverStatic, cipher, false, authorize, assign)
+		sc <- hsResult{id, err}
 	}()
-
 	a.SetDeadline(time.Now().Add(2 * time.Second))
-	ident, err := initiateHandshake(a, psk, CipherAESGCM, "", clientID, 4, req)
+	cli, err = initiateHandshake(a, clientStatic, serverStatic.Public, cipher, false, 4, req)
 	if err != nil {
 		t.Fatalf("initiate: %v", err)
 	}
-	if ident.userName != "" {
-		t.Fatalf("expected empty userName, got %q", ident.userName)
+	r := <-sc
+	if r.err != nil {
+		t.Fatalf("accept: %v", r.err)
 	}
-	if ident.assigned4.String() != "10.66.0.10" {
-		t.Fatalf("bad assignment: %v", ident.assigned4)
-	}
-	if err := <-serverDone; err != nil {
-		t.Fatalf("server: %v", err)
+	return cli, r.id
+}
+
+func assignFixedV4() acceptAssignFunc {
+	return func(name string, id [clientIDLen]byte, r AssignmentRequest) (AssignmentResponse, error) {
+		return AssignmentResponse{
+			V4Addr:   netip.MustParseAddr("10.66.0.10"),
+			V4Prefix: 24,
+			V4Peer:   netip.MustParseAddr("10.66.0.1"),
+		}, nil
 	}
 }
 
-// TestHandshakeRoundtripUserDB exercises the per-user identity path:
-// the client sends a username, the server selects the matching PSK,
-// the HMAC chain verifies on both sides.
-func TestHandshakeRoundtripUserDB(t *testing.T) {
-	alicePSK := bytesPattern(32)
-	bobPSK := bytesPattern(16)
-	for i := range bobPSK {
-		bobPSK[i] = 0xab
+// TestHandshakeRoundtripSinglePeer exercises single-peer mode: the server
+// authorizes one client static public key.
+func TestHandshakeRoundtripSinglePeer(t *testing.T) {
+	serverPriv, _ := genKeyT(t)
+	clientPriv, clientPub := genKeyT(t)
+	authorize := serverAuthorizer(nil, clientPub)
+
+	cli, srv := runHandshake(t, serverPriv, clientPriv, authorize, assignFixedV4(), CipherAESGCM,
+		AssignmentRequest{V4: netip.MustParseAddr("10.66.0.10")})
+
+	if cli.assigned4.String() != "10.66.0.10" {
+		t.Fatalf("bad assignment: %v", cli.assigned4)
 	}
+	if !bytes.Equal(srv.pubKey, clientPub) {
+		t.Fatalf("server saw wrong client pubkey")
+	}
+	assertKeysAgree(t, cli, srv)
+}
+
+// TestHandshakeRoundtripUserDB exercises multi-client mode: clients are
+// authorized by static public key against the user DB.
+func TestHandshakeRoundtripUserDB(t *testing.T) {
+	serverPriv, _ := genKeyT(t)
+	alicePriv, alicePub := genKeyT(t)
+	_, bobPub := genKeyT(t)
 	db, err := NewUserDB([]User{
-		{Name: "alice", PSK: alicePSK, MaxConcurrent: 2},
-		{Name: "bob", PSK: bobPSK},
+		{Name: "alice", PublicKey: alicePub, MaxConcurrent: 2},
+		{Name: "bob", PublicKey: bobPub},
 	})
 	if err != nil {
 		t.Fatalf("NewUserDB: %v", err)
 	}
 
-	a, b := net.Pipe()
-	defer a.Close()
-	defer b.Close()
-
-	var clientID [clientIDLen]byte
-	clientID[0] = 0xaa
-
-	serverDone := make(chan error, 1)
-	go func() {
-		assign := func(name string, id [clientIDLen]byte, r AssignmentRequest) (AssignmentResponse, error) {
-			if name != "alice" {
-				t.Errorf("expected user alice, got %q", name)
-			}
-			return AssignmentResponse{
-				V4Addr:   netip.MustParseAddr("10.66.0.10"),
-				V4Prefix: 24,
-				V4Peer:   netip.MustParseAddr("10.66.0.1"),
-			}, nil
+	assign := func(name string, id [clientIDLen]byte, r AssignmentRequest) (AssignmentResponse, error) {
+		if name != "alice" {
+			t.Errorf("expected user alice, got %q", name)
 		}
-		_, err := acceptHandshake(b, userDBResolver(db, nil), assign)
-		serverDone <- err
-	}()
+		return AssignmentResponse{V4Addr: netip.MustParseAddr("10.66.0.10"), V4Prefix: 24}, nil
+	}
+	cli, srv := runHandshake(t, serverPriv, alicePriv, serverAuthorizer(db, nil), assign, CipherChaCha, AssignmentRequest{})
+	if srv.userName != "alice" {
+		t.Fatalf("expected userName alice, got %q", srv.userName)
+	}
+	assertKeysAgree(t, cli, srv)
+}
 
-	a.SetDeadline(time.Now().Add(2 * time.Second))
-	ident, err := initiateHandshake(a, alicePSK, CipherAESGCM, "alice", clientID, 4, AssignmentRequest{})
-	if err != nil {
-		t.Fatalf("initiate: %v", err)
-	}
-	if ident.userName != "alice" {
-		t.Fatalf("expected userName alice, got %q", ident.userName)
-	}
-	if err := <-serverDone; err != nil {
-		t.Fatalf("server: %v", err)
+// TestHandshakeForwardSecrecy verifies two handshakes between the same
+// identities derive different transport keys (the ephemeral DH).
+func TestHandshakeForwardSecrecy(t *testing.T) {
+	serverPriv, _ := genKeyT(t)
+	clientPriv, clientPub := genKeyT(t)
+	auth := serverAuthorizer(nil, clientPub)
+	cli1, _ := runHandshake(t, serverPriv, clientPriv, auth, nil, CipherAESGCM, AssignmentRequest{})
+	cli2, _ := runHandshake(t, serverPriv, clientPriv, auth, nil, CipherAESGCM, AssignmentRequest{})
+
+	if bytes.Equal(cli1.keys.tx, cli2.keys.tx) || bytes.Equal(cli1.keys.rx, cli2.keys.rx) {
+		t.Fatal("transport keys repeated across handshakes; ephemeral DH not in effect")
 	}
 }
 
-// TestHandshakeUnknownUser verifies that the server rejects a name
-// that is not in the database.
-func TestHandshakeUnknownUser(t *testing.T) {
-	db, err := NewUserDB([]User{{Name: "alice", PSK: bytesPattern(16)}})
-	if err != nil {
-		t.Fatalf("NewUserDB: %v", err)
-	}
+// TestHandshakeWrongServerKey: a client that targets the wrong server
+// public key cannot complete the handshake.
+func TestHandshakeWrongServerKey(t *testing.T) {
+	defer shortHandshakeTimeout()()
+	serverPriv, _ := genKeyT(t)
+	clientPriv, clientPub := genKeyT(t)
+	_, wrongServerPub := genKeyT(t)
+
 	a, b := net.Pipe()
-	defer a.Close()
-	defer b.Close()
+	t.Cleanup(func() { a.Close(); b.Close() })
+	serverStatic, _ := noiseStatic(serverPriv)
+	clientStatic, _ := noiseStatic(clientPriv)
 
-	serverDone := make(chan error, 1)
+	sc := make(chan error, 1)
 	go func() {
-		_, err := acceptHandshake(b, userDBResolver(db, nil), nil)
-		serverDone <- err
+		_, err := acceptHandshake(b, serverStatic, CipherAESGCM, false, serverAuthorizer(nil, clientPub), nil)
+		sc <- err
 	}()
-
-	a.SetDeadline(time.Now().Add(2 * time.Second))
-	var clientID [clientIDLen]byte
-	_, err = initiateHandshake(a, bytesPattern(16), CipherNone, "carol", clientID, 1, AssignmentRequest{})
-	// client side may see EOF or HMAC mismatch depending on timing; we
-	// only need the server to reject.
-	_ = err
-	got := <-serverDone
-	if got == nil {
-		t.Fatalf("expected server reject, got nil")
+	go func() {
+		_, _ = initiateHandshake(a, clientStatic, wrongServerPub, CipherAESGCM, false, 1, AssignmentRequest{})
+		a.Close()
+	}()
+	if err := <-sc; err == nil {
+		t.Fatal("expected server to reject a client using the wrong server key")
 	}
+}
+
+// TestHandshakeUnknownClient: an unauthorized client key is rejected.
+func TestHandshakeUnknownClient(t *testing.T) {
+	defer shortHandshakeTimeout()()
+	serverPriv, _ := genKeyT(t)
+	clientPriv, _ := genKeyT(t)
+	_, otherPub := genKeyT(t) // the only authorized key, which the client does not hold
+
+	a, b := net.Pipe()
+	t.Cleanup(func() { a.Close(); b.Close() })
+	serverStatic, _ := noiseStatic(serverPriv)
+	clientStatic, _ := noiseStatic(clientPriv)
+
+	sc := make(chan error, 1)
+	go func() {
+		_, err := acceptHandshake(b, serverStatic, CipherAESGCM, false, serverAuthorizer(nil, otherPub), assignFixedV4())
+		sc <- err
+	}()
+	go func() {
+		_, _ = initiateHandshake(a, clientStatic, serverStatic.Public, CipherAESGCM, false, 1, AssignmentRequest{})
+		a.Close()
+	}()
+	if err := <-sc; err == nil {
+		t.Fatal("expected server to reject an unauthorized client key")
+	}
+}
+
+func assertKeysAgree(t *testing.T, cli, srv laneIdentity) {
+	t.Helper()
+	if len(cli.keys.tx) == 0 {
+		t.Fatal("empty transport key")
+	}
+	if !bytes.Equal(cli.keys.tx, srv.keys.rx) {
+		t.Fatal("client tx key != server rx key")
+	}
+	if !bytes.Equal(cli.keys.rx, srv.keys.tx) {
+		t.Fatal("client rx key != server tx key")
+	}
+}
+
+// shortHandshakeTimeout lowers the handshake deadline for negative tests
+// that would otherwise wait out the full production timeout.
+func shortHandshakeTimeout() func() {
+	old := hsTimeout
+	hsTimeout = 200 * time.Millisecond
+	return func() { hsTimeout = old }
 }
 
 func bytesPattern(n int) []byte {

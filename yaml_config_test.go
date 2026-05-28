@@ -1,20 +1,23 @@
 package packethose
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
 )
 
 func TestLoadFileAndApply(t *testing.T) {
+	serverPriv, _, _ := GenerateKeypair()
 	dir := t.TempDir()
 	path := filepath.Join(dir, "server.yaml")
-	body := `
+	body := fmt.Sprintf(`
 listen: 0.0.0.0:4500
 lanes: 4
 mptcp: false
 cipher: aes-gcm
 bbr: true
+server_private_key: %q
 brutal:
   enabled: false
   rate_mbps: 0
@@ -23,26 +26,24 @@ pool:
   server_ip4: 10.66.0.1
 users:
   - name: alice
-    psk_hex: "0102030405060708090a0b0c0d0e0f10"
+    public_key: %q
     max_concurrent: 3
   - name: bob
-    psk_hex: "1112131415161718191a1b1c1d1e1f20"
+    public_key: %q
     max_concurrent: 2
     reserved: [10.66.0.5]
 forward:
   isolation: true
   masquerade: true
   tproxy: false
-`
+  metering: true
+`, FormatKey(serverPriv), FormatKey(testPub(0xaa)), FormatKey(testPub(0xbb)))
 	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
 		t.Fatalf("write: %v", err)
 	}
 	fc, err := LoadFile(path)
 	if err != nil {
 		t.Fatalf("LoadFile: %v", err)
-	}
-	if fc.Listen != "0.0.0.0:4500" {
-		t.Fatalf("listen: %q", fc.Listen)
 	}
 	if !fc.WantBBR() {
 		t.Fatalf("WantBBR should be true")
@@ -51,11 +52,8 @@ forward:
 	if err != nil {
 		t.Fatalf("ToUsers: %v", err)
 	}
-	if len(users) != 2 {
-		t.Fatalf("users len: %d", len(users))
-	}
-	if users[1].Name != "bob" || len(users[1].Reserved) != 1 {
-		t.Fatalf("bob: %#v", users[1])
+	if len(users) != 2 || users[1].Name != "bob" || len(users[1].Reserved) != 1 {
+		t.Fatalf("users: %#v", users)
 	}
 
 	var cfg ServerConfig
@@ -65,34 +63,42 @@ forward:
 	if cfg.Listen != "0.0.0.0:4500" {
 		t.Fatalf("Listen after apply: %q", cfg.Listen)
 	}
-	if !cfg.Subnet.IsValid() {
-		t.Fatalf("Subnet not set")
+	if len(cfg.StaticPrivateKey) != pubKeyLen {
+		t.Fatalf("StaticPrivateKey not set: %d", len(cfg.StaticPrivateKey))
 	}
-	if len(cfg.Users) != 2 {
-		t.Fatalf("Users not set: %d", len(cfg.Users))
+	if cfg.Cipher != CipherAESGCM {
+		t.Fatalf("Cipher not applied: %v", cfg.Cipher)
 	}
-	if !cfg.NFT.Enabled || !cfg.NFT.Isolation || !cfg.NFT.Masquerade {
+	if !cfg.Subnet.IsValid() || len(cfg.Users) != 2 {
+		t.Fatalf("pool/users not set")
+	}
+	if !cfg.NFT.Enabled || !cfg.NFT.Isolation || !cfg.NFT.Masquerade || !cfg.NFT.Accounting {
 		t.Fatalf("NFT not populated: %#v", cfg.NFT)
 	}
-	if cfg.NFT.TPROXY {
-		t.Fatalf("forward.tproxy was false but NFT.TPROXY is true")
+	if !cfg.NFT.PoolV4.IsValid() {
+		t.Fatalf("accounting needs PoolV4 threaded in")
 	}
-	if cfg.TPROXY.Enabled {
-		t.Fatalf("forward.tproxy was false but TPROXY.Enabled is true")
+	if cfg.NFT.TPROXY || cfg.TPROXY.Enabled {
+		t.Fatalf("forward.tproxy was false but TPROXY is on")
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("Validate: %v", err)
 	}
 }
 
 func TestApplyForwardTPROXYEnabled(t *testing.T) {
+	serverPriv, _, _ := GenerateKeypair()
 	dir := t.TempDir()
 	path := filepath.Join(dir, "server.yaml")
-	body := `
+	body := fmt.Sprintf(`
 listen: 0.0.0.0:4500
+server_private_key: %q
 pool:
   v4_subnet: 10.66.0.0/24
   server_ip4: 10.66.0.1
 users:
   - name: alice
-    psk_hex: "0102030405060708090a0b0c0d0e0f10"
+    public_key: %q
 forward:
   isolation: true
   masquerade: true
@@ -103,7 +109,7 @@ forward:
   tun_match: "phose-*"
 tproxy:
   udp_idle_secs: 30
-`
+`, FormatKey(serverPriv), FormatKey(testPub(0xaa)))
 	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
 		t.Fatalf("write: %v", err)
 	}

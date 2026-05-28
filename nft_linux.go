@@ -71,6 +71,16 @@ type NFTConfig struct {
 	// rather than looping through the tproxy listener.
 	ServerIP4 netip.Addr
 	ServerIP6 netip.Addr
+
+	// Accounting installs per-client byte counters keyed on the pool
+	// address. Counting happens in the kernel at prerouting and
+	// postrouting, so it is free on the data path and covers both
+	// forwarded and TPROXY-terminated traffic. Requires PoolV4 and/or
+	// PoolV6 to be set. Read the counters with Stats() or directly via
+	// `nft -j list set <family> <table> acct_up4`.
+	Accounting bool
+	PoolV4     netip.Prefix
+	PoolV6     netip.Prefix
 }
 
 // nftBin is the nftables(8) binary path. Overridable for tests.
@@ -245,6 +255,46 @@ func (n *NFTInstaller) buildScript() string {
 			fmt.Fprintf(&b, "    iifname %q oifname %q masquerade\n", n.cfg.TUNMatch, n.cfg.EgressInterface)
 		} else {
 			fmt.Fprintf(&b, "    iifname %q oifname != %q masquerade\n", n.cfg.TUNMatch, n.cfg.TUNMatch)
+		}
+		fmt.Fprintf(&b, "  }\n")
+	}
+
+	if n.cfg.Accounting {
+		acctV4 := n.cfg.IPv4 && n.cfg.PoolV4.IsValid()
+		acctV6 := n.cfg.IPv6 && n.cfg.PoolV6.IsValid()
+		// Dynamic sets auto-create one counter per client address on its
+		// first packet; `update` increments without terminating the
+		// chain. Names are stable so Stats() and external pollers can
+		// find them.
+		if acctV4 {
+			fmt.Fprintf(&b, "  set acct_up4 { type ipv4_addr; flags dynamic; size 65535; counter; }\n")
+			fmt.Fprintf(&b, "  set acct_down4 { type ipv4_addr; flags dynamic; size 65535; counter; }\n")
+		}
+		if acctV6 {
+			fmt.Fprintf(&b, "  set acct_up6 { type ipv6_addr; flags dynamic; size 65535; counter; }\n")
+			fmt.Fprintf(&b, "  set acct_down6 { type ipv6_addr; flags dynamic; size 65535; counter; }\n")
+		}
+		// Ingress (client -> internet): count by source, before tproxy
+		// or forward see the packet. Priority is the lowest so it runs
+		// first and observes every byte.
+		fmt.Fprintf(&b, "  chain acct_ingress {\n")
+		fmt.Fprintf(&b, "    type filter hook prerouting priority -300; policy accept;\n")
+		if acctV4 {
+			fmt.Fprintf(&b, "    ip saddr %s update @acct_up4 { ip saddr }\n", n.cfg.PoolV4)
+		}
+		if acctV6 {
+			fmt.Fprintf(&b, "    ip6 saddr %s update @acct_up6 { ip6 saddr }\n", n.cfg.PoolV6)
+		}
+		fmt.Fprintf(&b, "  }\n")
+		// Egress (internet -> client): count by destination at
+		// postrouting, after any return-path NAT has been undone.
+		fmt.Fprintf(&b, "  chain acct_egress {\n")
+		fmt.Fprintf(&b, "    type filter hook postrouting priority -300; policy accept;\n")
+		if acctV4 {
+			fmt.Fprintf(&b, "    ip daddr %s update @acct_down4 { ip daddr }\n", n.cfg.PoolV4)
+		}
+		if acctV6 {
+			fmt.Fprintf(&b, "    ip6 daddr %s update @acct_down6 { ip6 daddr }\n", n.cfg.PoolV6)
 		}
 		fmt.Fprintf(&b, "  }\n")
 	}

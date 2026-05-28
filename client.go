@@ -2,7 +2,6 @@ package packethose
 
 import (
 	"context"
-	"crypto/rand"
 	"log"
 	"net"
 	"sync"
@@ -30,18 +29,18 @@ func NewClient(cfg ClientConfig) (*Client, error) {
 		logger = log.Default()
 	}
 	c := &Client{cfg: cfg, logger: logger}
-	if cfg.ClientID != [clientIDLen]byte{} {
-		c.clientID = cfg.ClientID
-	} else {
-		if _, err := rand.Read(c.clientID[:]); err != nil {
+	if cfg.keyed() {
+		pub, err := PublicFromPrivate(cfg.StaticPrivateKey)
+		if err != nil {
 			return nil, err
 		}
+		c.clientID = deriveClientID(pub)
 	}
 	return c, nil
 }
 
-// ClientID returns the stable 16-byte identifier this client sends on every
-// lane handshake.
+// ClientID returns the stable 16-byte session identifier derived from
+// this client's static public key (zero in open mode).
 func (cl *Client) ClientID() [clientIDLen]byte { return cl.clientID }
 
 // Run blocks until ctx is canceled.
@@ -64,7 +63,7 @@ func (cl *Client) Run(ctx context.Context) error {
 		req.V6 = cl.cfg.RequestIP6
 	}
 
-	src := clientSource(cl.cfg.Peer, cl.cfg.PSK, cl.cfg.Cipher, dialer, cl.cfg.UserName, cl.clientID, byte(cl.cfg.Lanes), req)
+	src := clientSource(cl.cfg.Peer, cl.cfg.StaticPrivateKey, cl.cfg.PeerPublicKey, cl.cfg.Cipher, localUSO(cl.cfg.Queues), dialer, byte(cl.cfg.Lanes), req)
 
 	var assignOnce sync.Once
 	onAssign := func(a Assignment) {

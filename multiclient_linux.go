@@ -12,6 +12,8 @@ import (
 	"runtime"
 	"sync"
 	"time"
+
+	"github.com/flynn/noise"
 )
 
 // multiClientLoop accepts inbound connections, groups them by client
@@ -39,7 +41,7 @@ import (
 //   - Per-client backpressure lives in the bounded outbound channel:
 //     a noisy client's queue fills and the tunReaders drop packets
 //     for that client only; other clients keep flowing.
-func multiClientLoop(ctx context.Context, ln net.Listener, cfg ServerConfig, users *UserDB, pool4, pool6 *ipPool, logger *log.Logger) error {
+func multiClientLoop(ctx context.Context, ln net.Listener, cfg ServerConfig, userDB *userDBHolder, static noise.DHKey, pool4, pool6 *ipPool, metrics *Metrics, logger *log.Logger) error {
 	tunName := cfg.TUNName
 	if tunName == "" {
 		tunName = "phose0"
@@ -62,10 +64,13 @@ func multiClientLoop(ctx context.Context, ln net.Listener, cfg ServerConfig, use
 
 	state := &mcState{
 		cfg:           cfg,
-		users:         users,
+		userDB:        userDB,
+		static:        static,
 		pool4:         pool4,
 		pool6:         pool6,
 		logger:        logger,
+		metrics:       metrics,
+		limiter:       newConnLimiter(cfg.RateLimit),
 		sharedQueues:  queues,
 		sharedIfname:  ifname,
 		sharedVnetHdr: cfg.VnetHdr,
@@ -89,22 +94,38 @@ func multiClientLoop(ctx context.Context, ln net.Listener, cfg ServerConfig, use
 			}
 			continue
 		}
-		if cfg.AllowIP != "" {
-			if ip := remoteIP(c); ip != cfg.AllowIP {
-				logger.Printf("reject %s (allow=%s)", ip, cfg.AllowIP)
-				c.Close()
-				continue
-			}
+		metrics.incAccept()
+		ip := remoteIP(c)
+		if cfg.AllowIP != "" && ip != cfg.AllowIP {
+			logger.Printf("reject %s (allow=%s)", ip, cfg.AllowIP)
+			c.Close()
+			continue
 		}
-		go state.handleConn(ctx, c)
+		if !state.limiter.allowIP(ip) {
+			metrics.incRateLimited()
+			logger.Printf("rate-limited %s", ip)
+			c.Close()
+			continue
+		}
+		release, ok := state.limiter.acquireSlot()
+		if !ok {
+			metrics.incSlotsFull()
+			logger.Printf("handshake slots full; dropping %s", ip)
+			c.Close()
+			continue
+		}
+		go state.handleConn(ctx, c, release)
 	}
 }
 
 type mcState struct {
 	cfg          ServerConfig
-	users        *UserDB
+	userDB       *userDBHolder
+	static       noise.DHKey
 	pool4, pool6 *ipPool
 	logger       *log.Logger
+	metrics      *Metrics
+	limiter      *connLimiter
 
 	sharedQueues  []PacketIO
 	sharedIfname  string
@@ -140,13 +161,18 @@ type session struct {
 	cancel context.CancelFunc
 }
 
-func (m *mcState) handleConn(ctx context.Context, c net.Conn) {
+func (m *mcState) handleConn(ctx context.Context, c net.Conn, releaseSlot func()) {
+	// The in-flight permit covers the handshake only; it is freed as
+	// soon as the handshake resolves so a long-lived session does not
+	// hold a slot. The deferred call is the backstop for early returns.
+	defer releaseSlot()
 	assignFn := func(userName string, clientID [clientIDLen]byte, req AssignmentRequest) (AssignmentResponse, error) {
 		// Quota is enforced in acquireSession (per-session, not
 		// per-handshake). assignFn just allocates the address.
 		var resp AssignmentResponse
+		db := m.userDB.get()
 		if m.pool4 != nil {
-			addr, err := m.pool4.AllocateFor(userName, clientID, req.V4, m.users)
+			addr, err := m.pool4.AllocateFor(userName, clientID, req.V4, db)
 			if err != nil {
 				m.logger.Printf("ipPool v4 user=%q: %v", userName, err)
 			} else {
@@ -156,7 +182,7 @@ func (m *mcState) handleConn(ctx context.Context, c net.Conn) {
 			}
 		}
 		if m.pool6 != nil {
-			addr, err := m.pool6.AllocateFor(userName, clientID, req.V6, m.users)
+			addr, err := m.pool6.AllocateFor(userName, clientID, req.V6, db)
 			if err != nil {
 				m.logger.Printf("ipPool v6 user=%q: %v", userName, err)
 			} else {
@@ -167,15 +193,21 @@ func (m *mcState) handleConn(ctx context.Context, c net.Conn) {
 		}
 		return resp, nil
 	}
-	var resolve pskResolver
-	if m.users != nil && !m.users.Empty() {
-		resolve = userDBResolver(m.users, m.cfg.PSK)
-	} else {
-		resolve = singlePSKResolver(m.cfg.PSK)
-	}
-	ident, err := acceptHandshake(c, resolve, assignFn)
+	authorize := serverAuthorizer(m.userDB.get(), m.cfg.PeerPublicKey)
+	// USO is negotiated off in multi-client mode: the shared TUN serves all
+	// clients, so per-client offload toggling is not possible.
+	ident, err := acceptHandshake(c, m.static, m.cfg.Cipher, false, authorize, assignFn)
 	if err != nil {
+		m.metrics.incHandshakeFail()
 		m.logger.Printf("handshake fail from %s: %v", c.RemoteAddr(), err)
+		// The handshake authenticates the client before assignFn runs,
+		// so an unauthenticated peer never reaches an allocation. A
+		// failure after that point (e.g. a dropped write) may have left
+		// a speculative allocation; release it when no live session owns
+		// this client, so an aborted handshake cannot leak pool entries.
+		if ident.clientID != ([clientIDLen]byte{}) {
+			m.releaseOrphan(ident.clientID)
+		}
 		c.Close()
 		return
 	}
@@ -184,6 +216,11 @@ func (m *mcState) handleConn(ctx context.Context, c net.Conn) {
 		c.Close()
 		return
 	}
+
+	m.metrics.incHandshakeOK()
+	// Handshake done: free the in-flight permit before the session's
+	// long-lived I/O loop so the cap counts handshakes, not sessions.
+	releaseSlot()
 
 	sess, isNew, err := m.acquireSession(ctx, ident)
 	if err != nil {
@@ -239,8 +276,8 @@ func (m *mcState) acquireSession(parent context.Context, ident laneIdentity) (*s
 		m.mu.Unlock()
 		return s, false, nil
 	}
-	if m.users != nil && !m.users.Empty() {
-		if err := m.users.AcquireSlot(ident.userName); err != nil {
+	if db := m.userDB.get(); db != nil && !db.Empty() {
+		if err := db.AcquireSlot(ident.userName); err != nil {
 			m.mu.Unlock()
 			m.releaseAll(ident.clientID)
 			return nil, false, err
@@ -269,11 +306,18 @@ func (m *mcState) acquireSession(parent context.Context, ident laneIdentity) (*s
 	m.sessions[ident.clientID] = s
 	if ident.assigned4.IsValid() {
 		m.ipIndex[ident.assigned4] = s
+		if m.pool4 != nil {
+			m.pool4.Claim(ident.clientID, ident.assigned4)
+		}
 	}
 	if ident.assigned6.IsValid() {
 		m.ipIndex[ident.assigned6] = s
+		if m.pool6 != nil {
+			m.pool6.Claim(ident.clientID, ident.assigned6)
+		}
 	}
 	m.mu.Unlock()
+	m.metrics.incSessionOpened()
 	return s, true, nil
 }
 
@@ -324,6 +368,19 @@ func (m *mcState) releaseAll(id [clientIDLen]byte) {
 	if m.pool6 != nil {
 		m.pool6.Release(id)
 	}
+}
+
+// releaseOrphan frees a client's pool allocation only when no live
+// session owns it. It holds m.mu across the release so it cannot race a
+// concurrent acquireSession (which claims the same addresses under the
+// same lock) for the same client.
+func (m *mcState) releaseOrphan(id [clientIDLen]byte) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, live := m.sessions[id]; live {
+		return
+	}
+	m.releaseAll(id)
 }
 
 func (m *mcState) gc(ctx context.Context) {
@@ -391,9 +448,10 @@ func (m *mcState) tearDown(s *session) {
 	s.cancel()
 	s.closeOnce.Do(func() { close(s.closed) })
 	m.releaseAll(s.id)
-	if s.userName != "" && m.users != nil {
-		m.users.ReleaseSlot(s.userName)
+	if s.userName != "" {
+		m.userDB.get().ReleaseSlot(s.userName)
 	}
+	m.metrics.incSessionClosed()
 	m.logger.Printf("session %x: torn down", s.id[:4])
 }
 

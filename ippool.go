@@ -27,8 +27,8 @@ type ipPool struct {
 	isV4     bool
 
 	mu       sync.Mutex
-	used     map[netip.Addr]bool                 // bitmap occupancy (v4)
-	byClient map[[clientIDLen]byte]netip.Addr    // sticky map
+	used     map[netip.Addr]bool              // bitmap occupancy (v4)
+	byClient map[[clientIDLen]byte]netip.Addr // sticky map
 }
 
 func newIPPool(subnet netip.Prefix, reserved ...netip.Addr) (*ipPool, error) {
@@ -147,6 +147,27 @@ func (p *ipPool) AllocateFor(userName string, clientID [clientIDLen]byte, prefer
 		return candidate, nil
 	}
 	return netip.Addr{}, errors.New("ipPool: v6 hash collision (try a larger subnet)")
+}
+
+// Claim idempotently re-asserts a client's ownership of an address it
+// was already assigned during the handshake. A session calls this when
+// it is created so that a concurrent, racing release of an aborted lane
+// for the same client cannot leave the address free in the pool while a
+// live session is using it.
+func (p *ipPool) Claim(clientID [clientIDLen]byte, addr netip.Addr) {
+	if !addr.IsValid() {
+		return
+	}
+	if p.isV4 && !addr.Is4() {
+		return
+	}
+	if !p.isV4 && !addr.Is6() {
+		return
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.used[addr] = true
+	p.byClient[clientID] = addr
 }
 
 // Release returns a client's IP to the pool. Idempotent.

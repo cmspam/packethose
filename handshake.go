@@ -2,37 +2,54 @@ package packethose
 
 import (
 	"bytes"
-	"crypto/hmac"
-	"crypto/rand"
-	"crypto/sha256"
-	"encoding/binary"
 	"fmt"
-	"io"
 	"net"
 	"net/netip"
 	"time"
+
+	"github.com/flynn/noise"
 )
 
 const (
-	hsMagic   uint32 = 0x50484F53 // "PHOS"
-	hsVersion byte   = 5          // v5 adds a 16-byte username field for per-user identity
-	hsTimeout        = 5 * time.Second
+	hsVersion   byte = 7 // v7: Noise_IK static-key identity over the obfuscation envelope
 	nonceLen         = 32
-	macLen           = 32
 	clientIDLen      = 16
+	pubKeyLen        = 32
 
 	// On-wire address slot: family(1) || addr(16). family ∈ {0,4,6}.
 	addrSlotLen = 17
+
+	// Handshake payload sizes (carried inside the Noise messages, which
+	// are themselves carried inside the obfuscation envelope). The trailing
+	// byte of each is a capability/flags field.
+	clientPayloadLen = 1 + 1 + 1 + addrSlotLen + addrSlotLen + 1 // ver, cipher, lane_count, req_v4, req_v6, flags
+	serverPayloadLen = 1 + addrSlotLen + 1 + addrSlotLen + addrSlotLen + 1 + addrSlotLen + 1
+
+	// hsFlagUSO marks the sender as able to do UDP segmentation offload.
+	// USO is used only when both peers set it.
+	hsFlagUSO byte = 1 << 0
 )
 
-// laneIdentity carries what the lane supervisors need: the cipher, derived
-// session keys, the client identity, and (in multi-client mode) the
-// server-assigned tunnel addresses for IPv4 and/or IPv6.
+// hsPrologue binds both peers to the protocol identity; a mismatch makes
+// the Noise handshake fail.
+var hsPrologue = []byte("packethose-v7")
+
+// hsTimeout bounds how long a handshake may take. A malformed or stalled
+// peer is held until this elapses and then dropped, which also slows
+// connection-flood probing. It is a var so tests can shorten it.
+var hsTimeout = 5 * time.Second
+
+// laneIdentity carries what the lane supervisors need: the transport
+// ciphers, the client identity (its static public key and the derived
+// session id), and (in multi-client mode) the server-assigned tunnel
+// addresses.
 type laneIdentity struct {
-	keys      laneKeys
-	clientID  [clientIDLen]byte
-	laneCount byte
-	userName  string
+	keys       laneKeys
+	clientID   [clientIDLen]byte
+	pubKey     []byte
+	laneCount  byte
+	userName   string
+	usoEnabled bool // both peers support UDP segmentation offload
 
 	assigned4 netip.Addr
 	prefix4   byte
@@ -84,8 +101,8 @@ func decodeAddrSlot(b []byte) netip.Addr {
 
 // AssignmentRequest is what the client asks for in its handshake.
 type AssignmentRequest struct {
-	V4 netip.Addr // zero / Is4() == false ⇒ no v4 request
-	V6 netip.Addr // zero / Is6() == false ⇒ no v6 request
+	V4 netip.Addr
+	V6 netip.Addr
 }
 
 // AssignmentResponse is what the server returns. A family with prefix == 0
@@ -100,328 +117,249 @@ type AssignmentResponse struct {
 	V6Peer   netip.Addr
 }
 
-// AssignFunc is the server-side hook that picks per-family addresses for an
-// incoming client. Implementations return zero / 0-prefix to decline a family.
+// AssignFunc is the server-side hook that picks per-family addresses.
 type AssignFunc func(clientID [clientIDLen]byte, req AssignmentRequest) AssignmentResponse
 
-// Wire layout, v5 (v4 plus a leading 16-byte username field so the server
-// can select the matching PSK in O(1)):
-//
-//   client ->
-//     magic(4) || ver(1)=5 || cipher(1) || user_name(16) || nonce_c(32)
-//       || client_id(16) || lane_count(1)
-//       || req_v4(17) || req_v6(17)
-//
-//   server ->
-//     magic(4) || ver(1)=5 || cipher(1)
-//       || HMAC(psk, ver||cipher||user_name||nonce_c||client_id||lane_count||req_v4||req_v6)(32)
-//       || nonce_s(32)
-//       || asg_v4(17) || prefix_v4(1) || peer_v4(17)
-//       || asg_v6(17) || prefix_v6(1) || peer_v6(17)
-//
-//   client ->
-//     HMAC(psk, ver||cipher||user_name||nonce_s||asg_v4||prefix_v4||peer_v4||asg_v6||prefix_v6||peer_v6)(32)
+// pubKeyAuthorizer authorizes a client by its static public key,
+// returning the human-readable user name (empty in single-peer mode) or
+// an error to reject. It runs before any address is allocated, so an
+// unauthorized peer can never drive an allocation.
+type pubKeyAuthorizer func(clientPub []byte) (userName string, err error)
 
-const (
-	clientMsgLen = 4 + 1 + 1 + userNameLen + nonceLen + clientIDLen + 1 + addrSlotLen + addrSlotLen
-	serverMsgLen = 4 + 1 + 1 + macLen + nonceLen + addrSlotLen + 1 + addrSlotLen + addrSlotLen + 1 + addrSlotLen
-)
-
-func initiateHandshake(c net.Conn, psk []byte, want Cipher, userName string, clientID [clientIDLen]byte, laneCount byte, req AssignmentRequest) (laneIdentity, error) {
-	if len(psk) == 0 {
-		if want != CipherNone {
-			return laneIdentity{}, fmt.Errorf("encrypt requires PSK")
-		}
-		return laneIdentity{clientID: clientID, laneCount: laneCount}, nil
-	}
-	c.SetDeadline(time.Now().Add(hsTimeout))
-	defer c.SetDeadline(time.Time{})
-
-	var nonceC [nonceLen]byte
-	if _, err := rand.Read(nonceC[:]); err != nil {
-		return laneIdentity{}, err
-	}
-
-	wireName := encodeUserName(userName)
-	reqV4 := encodeAddrSlot(req.V4)
-	reqV6 := encodeAddrSlot(req.V6)
-
-	msg := make([]byte, clientMsgLen)
-	binary.BigEndian.PutUint32(msg[0:4], hsMagic)
-	msg[4] = hsVersion
-	msg[5] = byte(want)
-	off := 6
-	copy(msg[off:off+userNameLen], wireName[:])
-	off += userNameLen
-	copy(msg[off:off+nonceLen], nonceC[:])
-	off += nonceLen
-	copy(msg[off:off+clientIDLen], clientID[:])
-	off += clientIDLen
-	msg[off] = laneCount
-	off++
-	copy(msg[off:off+addrSlotLen], reqV4)
-	off += addrSlotLen
-	copy(msg[off:off+addrSlotLen], reqV6)
-
-	if _, err := c.Write(msg); err != nil {
-		return laneIdentity{}, err
-	}
-
-	resp := make([]byte, serverMsgLen)
-	if _, err := io.ReadFull(c, resp); err != nil {
-		return laneIdentity{}, err
-	}
-	if binary.BigEndian.Uint32(resp[0:4]) != hsMagic {
-		return laneIdentity{}, fmt.Errorf("handshake: bad magic")
-	}
-	if resp[4] != hsVersion {
-		return laneIdentity{}, fmt.Errorf("handshake: version mismatch (got %d, want %d)", resp[4], hsVersion)
-	}
-	got := Cipher(resp[5])
-	if got != want {
-		return laneIdentity{}, fmt.Errorf("handshake: cipher rejected (sent %s, got %s)", want, got)
-	}
-	authIn := concat(
-		[]byte{hsVersion, byte(got)},
-		wireName[:],
-		nonceC[:],
-		clientID[:],
-		[]byte{laneCount},
-		reqV4,
-		reqV6,
-	)
-	if !hmac.Equal(hmacSHA256(psk, authIn), resp[6:6+macLen]) {
-		return laneIdentity{}, fmt.Errorf("handshake: server HMAC mismatch")
-	}
-
-	pos := 6 + macLen
-	nonceS := resp[pos : pos+nonceLen]
-	pos += nonceLen
-	asgV4Bytes := resp[pos : pos+addrSlotLen]
-	pos += addrSlotLen
-	prefix4 := resp[pos]
-	pos++
-	peerV4Bytes := resp[pos : pos+addrSlotLen]
-	pos += addrSlotLen
-	asgV6Bytes := resp[pos : pos+addrSlotLen]
-	pos += addrSlotLen
-	prefix6 := resp[pos]
-	pos++
-	peerV6Bytes := resp[pos : pos+addrSlotLen]
-
-	cliAuth := concat(
-		[]byte{hsVersion, byte(got)},
-		wireName[:],
-		nonceS,
-		asgV4Bytes, []byte{prefix4}, peerV4Bytes,
-		asgV6Bytes, []byte{prefix6}, peerV6Bytes,
-	)
-	if _, err := c.Write(hmacSHA256(psk, cliAuth)); err != nil {
-		return laneIdentity{}, err
-	}
-
-	tx, rx, err := deriveSessionKeys(psk, nonceC[:], nonceS, got, false)
-	if err != nil {
-		return laneIdentity{}, err
-	}
-	return laneIdentity{
-		keys:      laneKeys{kind: got, tx: tx, rx: rx},
-		clientID:  clientID,
-		laneCount: laneCount,
-		userName:  userName,
-		assigned4: decodeAddrSlot(asgV4Bytes),
-		prefix4:   prefix4,
-		peer4:     decodeAddrSlot(peerV4Bytes),
-		assigned6: decodeAddrSlot(asgV6Bytes),
-		prefix6:   prefix6,
-		peer6:     decodeAddrSlot(peerV6Bytes),
-	}, nil
-}
-
-// pskResolver returns the PSK to validate a client handshake against.
-// The wire name is the 16-byte field from the client message; the
-// resolver returns the empty user name when the legacy single-PSK
-// fallback path is in use.
-type pskResolver func(wireName [userNameLen]byte) (psk []byte, userName string, err error)
-
-// acceptAssignFunc is the per-handshake hook the server uses to
-// allocate addresses. It receives the identified user name so the
-// pool can apply per-user quota and reservation rules.
+// acceptAssignFunc is the server-side address-allocation hook, invoked
+// only after the client's static key has been authorized.
 type acceptAssignFunc func(userName string, clientID [clientIDLen]byte, req AssignmentRequest) (AssignmentResponse, error)
 
-func acceptHandshake(c net.Conn, resolve pskResolver, assignFn acceptAssignFunc) (laneIdentity, error) {
+// serverAuthorizer builds a pubKeyAuthorizer from the configured client
+// identities: the multi-client user DB when populated, otherwise the
+// single authorized peer public key. Public keys are not secret, so a
+// plain comparison is fine.
+func serverAuthorizer(users *UserDB, peerPub []byte) pubKeyAuthorizer {
+	return func(clientPub []byte) (string, error) {
+		if users != nil && !users.Empty() {
+			u := users.LookupByKey(clientPub)
+			if u == nil {
+				return "", ErrUnknownUser
+			}
+			return u.Name, nil
+		}
+		if len(peerPub) > 0 && bytes.Equal(clientPub, peerPub) {
+			return "", nil
+		}
+		return "", ErrUnknownUser
+	}
+}
+
+func usoFlag(uso bool) byte {
+	if uso {
+		return hsFlagUSO
+	}
+	return 0
+}
+
+func buildClientPayload(cipher Cipher, laneCount byte, req AssignmentRequest, uso bool) []byte {
+	out := make([]byte, 0, clientPayloadLen)
+	out = append(out, hsVersion, byte(cipher), laneCount)
+	out = append(out, encodeAddrSlot(req.V4)...)
+	out = append(out, encodeAddrSlot(req.V6)...)
+	out = append(out, usoFlag(uso))
+	return out
+}
+
+func parseClientPayload(p []byte) (cipher Cipher, laneCount byte, req AssignmentRequest, uso bool, err error) {
+	if len(p) < clientPayloadLen {
+		return 0, 0, AssignmentRequest{}, false, fmt.Errorf("handshake: short client payload")
+	}
+	if p[0] != hsVersion {
+		return 0, 0, AssignmentRequest{}, false, fmt.Errorf("handshake: version mismatch (got %d, want %d)", p[0], hsVersion)
+	}
+	cipher = Cipher(p[1])
+	laneCount = p[2]
+	req.V4 = decodeAddrSlot(p[3 : 3+addrSlotLen])
+	req.V6 = decodeAddrSlot(p[3+addrSlotLen : 3+2*addrSlotLen])
+	uso = p[3+2*addrSlotLen]&hsFlagUSO != 0
+	return cipher, laneCount, req, uso, nil
+}
+
+func buildServerPayload(asg AssignmentResponse, uso bool) []byte {
+	out := make([]byte, 0, serverPayloadLen)
+	out = append(out, hsVersion)
+	out = append(out, encodeAddrSlot(asg.V4Addr)...)
+	out = append(out, asg.V4Prefix)
+	out = append(out, encodeAddrSlot(asg.V4Peer)...)
+	out = append(out, encodeAddrSlot(asg.V6Addr)...)
+	out = append(out, asg.V6Prefix)
+	out = append(out, encodeAddrSlot(asg.V6Peer)...)
+	out = append(out, usoFlag(uso))
+	return out
+}
+
+func parseServerPayload(p []byte) (asg AssignmentResponse, uso bool, err error) {
+	if len(p) < serverPayloadLen {
+		return AssignmentResponse{}, false, fmt.Errorf("handshake: short server payload")
+	}
+	if p[0] != hsVersion {
+		return AssignmentResponse{}, false, fmt.Errorf("handshake: version mismatch (got %d, want %d)", p[0], hsVersion)
+	}
+	pos := 1
+	asg.V4Addr = decodeAddrSlot(p[pos : pos+addrSlotLen])
+	pos += addrSlotLen
+	asg.V4Prefix = p[pos]
+	pos++
+	asg.V4Peer = decodeAddrSlot(p[pos : pos+addrSlotLen])
+	pos += addrSlotLen
+	asg.V6Addr = decodeAddrSlot(p[pos : pos+addrSlotLen])
+	pos += addrSlotLen
+	asg.V6Prefix = p[pos]
+	pos++
+	asg.V6Peer = decodeAddrSlot(p[pos : pos+addrSlotLen])
+	pos += addrSlotLen
+	uso = p[pos]&hsFlagUSO != 0
+	return asg, uso, nil
+}
+
+// initiateHandshake runs the client (Noise initiator) side. static is
+// the client's own static keypair; serverPub is the server's static
+// public key, known in advance (the IK pre-message). The obfuscation
+// envelope is keyed by serverPub.
+func initiateHandshake(c net.Conn, static noise.DHKey, serverPub []byte, cipher Cipher, localUSO bool, laneCount byte, req AssignmentRequest) (laneIdentity, error) {
 	c.SetDeadline(time.Now().Add(hsTimeout))
 	defer c.SetDeadline(time.Time{})
 
-	hdr := make([]byte, clientMsgLen)
-	if _, err := io.ReadFull(c, hdr); err != nil {
-		return laneIdentity{}, err
-	}
-	if binary.BigEndian.Uint32(hdr[0:4]) != hsMagic {
-		return laneIdentity{}, fmt.Errorf("handshake: bad magic")
-	}
-	if hdr[4] != hsVersion {
-		return laneIdentity{}, fmt.Errorf("handshake: version mismatch (got %d, want %d)", hdr[4], hsVersion)
-	}
-	got := Cipher(hdr[5])
-	if got != CipherNone && got != CipherAESGCM && got != CipherChaCha {
-		return laneIdentity{}, fmt.Errorf("handshake: unknown cipher %d", got)
-	}
-	pos := 6
-	var wireName [userNameLen]byte
-	copy(wireName[:], hdr[pos:pos+userNameLen])
-	pos += userNameLen
-	nonceC := hdr[pos : pos+nonceLen]
-	pos += nonceLen
-	var clientID [clientIDLen]byte
-	copy(clientID[:], hdr[pos:pos+clientIDLen])
-	pos += clientIDLen
-	laneCount := hdr[pos]
-	pos++
-	reqV4Bytes := hdr[pos : pos+addrSlotLen]
-	pos += addrSlotLen
-	reqV6Bytes := hdr[pos : pos+addrSlotLen]
-
-	psk, userName, err := resolve(wireName)
+	obfsKey := obfsKeyFromServerPub(serverPub)
+	hs, err := noise.NewHandshakeState(noise.Config{
+		CipherSuite:   noiseSuite(cipher),
+		Pattern:       noise.HandshakeIK,
+		Initiator:     true,
+		Prologue:      hsPrologue,
+		StaticKeypair: static,
+		PeerStatic:    serverPub,
+	})
 	if err != nil {
 		return laneIdentity{}, err
 	}
-	if len(psk) == 0 {
-		return laneIdentity{}, fmt.Errorf("handshake: no PSK configured")
-	}
 
-	req := AssignmentRequest{
-		V4: decodeAddrSlot(reqV4Bytes),
-		V6: decodeAddrSlot(reqV6Bytes),
-	}
-	var asg AssignmentResponse
-	if assignFn != nil {
-		asg, err = assignFn(userName, clientID, req)
-		if err != nil {
-			return laneIdentity{}, err
-		}
-	}
-
-	var nonceS [nonceLen]byte
-	if _, err := rand.Read(nonceS[:]); err != nil {
-		return laneIdentity{}, err
-	}
-
-	asgV4 := encodeAddrSlot(asg.V4Addr)
-	peerV4 := encodeAddrSlot(asg.V4Peer)
-	asgV6 := encodeAddrSlot(asg.V6Addr)
-	peerV6 := encodeAddrSlot(asg.V6Peer)
-
-	resp := make([]byte, serverMsgLen)
-	binary.BigEndian.PutUint32(resp[0:4], hsMagic)
-	resp[4] = hsVersion
-	resp[5] = byte(got)
-	authIn := concat(
-		[]byte{hsVersion, byte(got)},
-		wireName[:],
-		nonceC, clientID[:],
-		[]byte{laneCount},
-		reqV4Bytes, reqV6Bytes,
-	)
-	copy(resp[6:6+macLen], hmacSHA256(psk, authIn))
-	pos = 6 + macLen
-	copy(resp[pos:pos+nonceLen], nonceS[:])
-	pos += nonceLen
-	copy(resp[pos:pos+addrSlotLen], asgV4)
-	pos += addrSlotLen
-	resp[pos] = asg.V4Prefix
-	pos++
-	copy(resp[pos:pos+addrSlotLen], peerV4)
-	pos += addrSlotLen
-	copy(resp[pos:pos+addrSlotLen], asgV6)
-	pos += addrSlotLen
-	resp[pos] = asg.V6Prefix
-	pos++
-	copy(resp[pos:pos+addrSlotLen], peerV6)
-
-	if _, err := c.Write(resp); err != nil {
-		return laneIdentity{}, err
-	}
-
-	ack := make([]byte, macLen)
-	if _, err := io.ReadFull(c, ack); err != nil {
-		return laneIdentity{}, err
-	}
-	cliAuth := concat(
-		[]byte{hsVersion, byte(got)},
-		wireName[:],
-		nonceS[:],
-		asgV4, []byte{asg.V4Prefix}, peerV4,
-		asgV6, []byte{asg.V6Prefix}, peerV6,
-	)
-	if !bytes.Equal(hmacSHA256(psk, cliAuth), ack) {
-		return laneIdentity{}, fmt.Errorf("handshake: client HMAC mismatch")
-	}
-
-	tx, rx, err := deriveSessionKeys(psk, nonceC, nonceS[:], got, true)
+	msg1, _, _, err := hs.WriteMessage(nil, buildClientPayload(cipher, laneCount, req, localUSO))
 	if err != nil {
 		return laneIdentity{}, err
 	}
+	if err := writeObfMsg(c, obfsKey, msg1); err != nil {
+		return laneIdentity{}, err
+	}
+
+	rawMsg2, err := readObfMsg(c, obfsKey)
+	if err != nil {
+		return laneIdentity{}, err
+	}
+	payload2, csTx, csRx, err := hs.ReadMessage(nil, rawMsg2)
+	if err != nil {
+		return laneIdentity{}, fmt.Errorf("handshake: server auth failed: %w", err)
+	}
+	asg, serverUSO, err := parseServerPayload(payload2)
+	if err != nil {
+		return laneIdentity{}, err
+	}
+
+	// ReadMessage returns (init->resp, resp->init). The client sends on
+	// the first and receives on the second.
 	return laneIdentity{
-		keys:      laneKeys{kind: got, tx: tx, rx: rx},
-		clientID:  clientID,
-		laneCount: laneCount,
-		userName:  userName,
-		assigned4: asg.V4Addr,
-		prefix4:   asg.V4Prefix,
-		peer4:     asg.V4Peer,
-		assigned6: asg.V6Addr,
-		prefix6:   asg.V6Prefix,
-		peer6:     asg.V6Peer,
+		keys:       laneKeys{encrypted: true, kind: cipher, tx: transportKey(cipher, csTx), rx: transportKey(cipher, csRx)},
+		clientID:   deriveClientID(static.Public),
+		pubKey:     static.Public,
+		laneCount:  laneCount,
+		usoEnabled: localUSO && serverUSO,
+		assigned4:  asg.V4Addr,
+		prefix4:    asg.V4Prefix,
+		peer4:      asg.V4Peer,
+		assigned6:  asg.V6Addr,
+		prefix6:    asg.V6Prefix,
+		peer6:      asg.V6Peer,
 	}, nil
 }
 
-// singlePSKResolver returns a pskResolver that always returns the
-// given PSK, ignoring the wire name. Used by the legacy single-PSK
-// server path.
-func singlePSKResolver(psk []byte) pskResolver {
-	return func(wireName [userNameLen]byte) ([]byte, string, error) {
-		return psk, decodeUserName(wireName), nil
-	}
-}
+// acceptHandshake runs the server (Noise responder) side. static is the
+// server's own static keypair; cipher must match what clients use (the
+// suite is not negotiated in-band). authorize vets the client's static
+// public key before assignFn allocates an address.
+func acceptHandshake(c net.Conn, static noise.DHKey, cipher Cipher, localUSO bool, authorize pubKeyAuthorizer, assignFn acceptAssignFunc) (laneIdentity, error) {
+	c.SetDeadline(time.Now().Add(hsTimeout))
+	defer c.SetDeadline(time.Time{})
 
-// userDBResolver returns a pskResolver that selects the PSK matching
-// the wire name. A non-empty legacyPSK is returned when the wire name
-// is empty so old call sites with a single shared PSK still work; an
-// unknown name returns ErrUnknownUser.
-func userDBResolver(db *UserDB, legacyPSK []byte) pskResolver {
-	return func(wireName [userNameLen]byte) ([]byte, string, error) {
-		name := decodeUserName(wireName)
-		if name == "" {
-			if len(legacyPSK) == 0 {
-				return nil, "", fmt.Errorf("handshake: client did not send user name and no legacy PSK is configured")
-			}
-			return legacyPSK, "", nil
+	obfsKey := obfsKeyFromServerPub(static.Public)
+	hs, err := noise.NewHandshakeState(noise.Config{
+		CipherSuite:   noiseSuite(cipher),
+		Pattern:       noise.HandshakeIK,
+		Initiator:     false,
+		Prologue:      hsPrologue,
+		StaticKeypair: static,
+	})
+	if err != nil {
+		return laneIdentity{}, err
+	}
+
+	rawMsg1, err := readObfMsg(c, obfsKey)
+	if err != nil {
+		return laneIdentity{}, err
+	}
+	payload1, _, _, err := hs.ReadMessage(nil, rawMsg1)
+	if err != nil {
+		// Bad envelope key, wrong cipher suite, or a client that does not
+		// hold a valid static key: rejected before any client identity is
+		// established, so nothing was allocated.
+		return laneIdentity{}, fmt.Errorf("handshake: client auth failed: %w", err)
+	}
+	clientPub := append([]byte(nil), hs.PeerStatic()...)
+	clientID := deriveClientID(clientPub)
+
+	// From here the client_id is known; surface it on error so the caller
+	// can release any allocation made below.
+	fail := func(err error) (laneIdentity, error) {
+		return laneIdentity{clientID: clientID, pubKey: clientPub}, err
+	}
+
+	userName, err := authorize(clientPub)
+	if err != nil {
+		return fail(err)
+	}
+	pCipher, laneCount, req, clientUSO, err := parseClientPayload(payload1)
+	if err != nil {
+		return fail(err)
+	}
+	if pCipher != cipher {
+		return fail(fmt.Errorf("handshake: cipher mismatch (client %s, server %s)", pCipher, cipher))
+	}
+
+	var asg AssignmentResponse
+	if assignFn != nil {
+		if asg, err = assignFn(userName, clientID, req); err != nil {
+			return fail(err)
 		}
-		u := db.Lookup(wireName)
-		if u == nil {
-			return nil, "", ErrUnknownUser
-		}
-		return u.PSK, u.Name, nil
 	}
-}
 
-func hmacSHA256(key, data []byte) []byte {
-	h := hmac.New(sha256.New, key)
-	h.Write(data)
-	return h.Sum(nil)
-}
+	msg2, csRx, csTx, err := hs.WriteMessage(nil, buildServerPayload(asg, localUSO))
+	if err != nil {
+		return fail(err)
+	}
+	if err := writeObfMsg(c, obfsKey, msg2); err != nil {
+		return fail(err)
+	}
 
-func concat(parts ...[]byte) []byte {
-	total := 0
-	for _, p := range parts {
-		total += len(p)
-	}
-	out := make([]byte, 0, total)
-	for _, p := range parts {
-		out = append(out, p...)
-	}
-	return out
+	// WriteMessage returns (init->resp, resp->init). The server receives
+	// on the first and sends on the second.
+	return laneIdentity{
+		keys:       laneKeys{encrypted: true, kind: cipher, tx: transportKey(cipher, csTx), rx: transportKey(cipher, csRx)},
+		clientID:   clientID,
+		pubKey:     clientPub,
+		laneCount:  laneCount,
+		userName:   userName,
+		usoEnabled: localUSO && clientUSO,
+		assigned4:  asg.V4Addr,
+		prefix4:    asg.V4Prefix,
+		peer4:      asg.V4Peer,
+		assigned6:  asg.V6Addr,
+		prefix6:    asg.V6Prefix,
+		peer6:      asg.V6Peer,
+	}, nil
 }
 
 func zeroAddrV4() netip.Addr {
